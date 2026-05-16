@@ -140,6 +140,22 @@ ios: app
 	&& cd bin \
 	&& tar -czvf streamplace-$(VERSION)-ios-release.xcarchive.tar.gz streamplace-$(VERSION)-ios-release.xcarchive
 
+.PHONY: tvos
+tvos: app
+	xcodebuild \
+		-workspace ./js/app/ios/Streamplace.xcworkspace \
+		-sdk appletvos \
+		-configuration Release \
+		-scheme Streamplace \
+		-archivePath ./bin/streamplace-$(VERSION)-tvos-release.xcarchive \
+		CODE_SIGN_IDENTITY=- \
+		AD_HOC_CODE_SIGNING_ALLOWED=YES \
+		CODE_SIGN_STYLE=Automatic \
+		DEVELOPMENT_TEAM=ZZZZZZZZZZ \
+		clean archive | xcpretty \
+	&& cd bin \
+	&& tar -czvf streamplace-$(VERSION)-tvos-release.xcarchive.tar.gz streamplace-$(VERSION)-tvos-release.xcarchive
+
 #    _____  ____
 #   / ____|/ __ \
 #  | |  __| |  | |

@@ -67,6 +67,12 @@ config.resolver.resolveRequest = (context, moduleName, platform) => {
 config.resolver.sourceExts.push("mjs");
 config.resolver.assetExts.push("md");
 
+// Make Metro pick `.tv.tsx` before `.ios.tsx` when building for tvOS.
+// react-native-tvos reports its platform as `tv` to Metro, so this lets
+// us ship TV-specific screens as platform-extension siblings of the
+// existing phone screens without touching the phone code path.
+config.resolver.platforms = ["tv", ...config.resolver.platforms];
+
 config.resolver.unstable_conditionNames.push("@streamplace/dev", "browser");
 
 // Ensure workspace packages get transformed by babel

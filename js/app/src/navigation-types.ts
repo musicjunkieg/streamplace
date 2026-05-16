@@ -69,6 +69,11 @@ export type RootStackParamList = {
   Video: undefined;
   Vod: { user: string; tid: string };
   VodEmbed: { user: string; tid: string };
+
+  // TV companion screens (phone/web only)
+  PairTV: { code?: string } | undefined;
+  TVChatInput: { streamer: string };
+  TVOSAuth: { code?: string } | undefined;
 };
 
 // Helper type for screen props

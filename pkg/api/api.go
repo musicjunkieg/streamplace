@@ -91,6 +91,8 @@ type StreamplaceAPI struct {
 	rtmpSessions             map[string]*media.RTMPSession
 	rtmpSessionsLock         sync.Mutex
 	rtmpInternalPlaybackAddr string
+
+	TVOSAuthStore *TVOSAuthStore
 }
 
 type WebsocketTracker struct {
@@ -225,6 +227,16 @@ func (a *StreamplaceAPI) Handler(ctx context.Context) (http.Handler, error) {
 		apiRouter.Handler("DELETE", "/api/upload/:id", a.UploadManager)
 		apiRouter.Handler("OPTIONS", "/api/upload/:id", a.UploadManager)
 	}
+
+	// Apple TV device-pairing OAuth. See pkg/api/tvos_auth.go.
+	if a.TVOSAuthStore == nil {
+		a.TVOSAuthStore = NewTVOSAuthStore(ctx)
+	}
+	addHandle(apiRouter, "POST", "/api/tvos-auth/start", a.HandleTVOSAuthStart(ctx))
+	addHandle(apiRouter, "GET", "/api/tvos-auth/:sessionId", a.HandleTVOSAuthPoll(ctx))
+	addHandle(apiRouter, "POST", "/api/tvos-auth/:sessionId/complete-browser", a.HandleTVOSAuthCompleteBrowser(ctx))
+	addHandle(apiRouter, "POST", "/api/tvos-auth/:sessionId/complete-mobile", a.HandleTVOSAuthCompleteMobile(ctx))
+
 	apiRouter.NotFound = a.HandleAPI404(ctx)
 	apiRouterHandler := a.RateLimitMiddleware(ctx)(apiRouter)
 	xrpcHandler := a.RateLimitMiddleware(ctx)(xrpc)

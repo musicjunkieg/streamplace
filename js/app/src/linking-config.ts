@@ -149,6 +149,11 @@ export const SCREEN_PATHS = {
   Video: ":user/video/:tid",
   Vod: ":user/minimal-vod/:tid",
   VodEmbed: "embed/:user/video/:tid",
+  // TV companion + auth screens (handled on phone/web; the TV uses its
+  // own native-stack navigator at shell.tv.tsx)
+  PairTV: "pair-tv",
+  TVChatInput: "tv-chat-input/:streamer",
+  TVOSAuth: "auth/tv",
 } as const;
 
 /**
@@ -264,6 +269,9 @@ export const streamplaceLinkingOptions: LinkingOptions<ReactNavigation.RootParam
         Video: SCREEN_PATHS.Video,
         Vod: SCREEN_PATHS.Vod,
         VodEmbed: SCREEN_PATHS.VodEmbed,
+        PairTV: SCREEN_PATHS.PairTV,
+        TVChatInput: SCREEN_PATHS.TVChatInput,
+        TVOSAuth: SCREEN_PATHS.TVOSAuth,
       },
     },
   };

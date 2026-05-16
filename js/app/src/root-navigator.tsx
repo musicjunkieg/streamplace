@@ -1,10 +1,13 @@
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { Platform } from "react-native";
+import PairTV from "src/screens/pair-tv";
 import PopoutChat from "src/screens/chat-popout";
 import DanmuOBSScreen from "src/screens/danmu-obs";
 import EmbedScreen from "src/screens/embed";
 import InfoWidgetEmbed from "src/screens/info-widget-embed";
 import MobileStream from "src/screens/mobile-stream";
+import TVChatInput from "src/screens/tv-chat-input";
+import TVOSAuth from "src/screens/tvos-auth";
 import type { RootStackParamList } from "./navigation-types";
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -25,6 +28,9 @@ export const RootNavigator = () => {
       <Stack.Screen name="Embed" component={EmbedScreen} />
       <Stack.Screen name="InfoWidgetEmbed" component={InfoWidgetEmbed} />
       <Stack.Screen name="DanmuOBS" component={DanmuOBSScreen} />
+      <Stack.Screen name="PairTV" component={PairTV} options={{ title: "Pair Apple TV" }} />
+      <Stack.Screen name="TVChatInput" component={TVChatInput} options={{ title: "TV chat" }} />
+      <Stack.Screen name="TVOSAuth" component={TVOSAuth} options={{ title: "Sign in for TV" }} />
     </Stack.Navigator>
   );
 };
