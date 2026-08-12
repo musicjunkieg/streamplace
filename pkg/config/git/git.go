@@ -330,6 +330,11 @@ func (g *Git) Describe(reference *plumbing.Reference) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if tag == nil {
+		// No tag reachable from HEAD — e.g. a fresh fork cloned with
+		// "copy the default branch only", which carries no tags at all.
+		return fmt.Sprintf("v0.0.0-%s", head.Hash().String()[0:8]), nil
+	}
 	if count == 0 && os.Getenv("CI_COMMIT_TAG") != "" {
 		return fmt.Sprint(tag.Name().Short()), nil
 	} else {
