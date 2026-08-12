@@ -52,6 +52,10 @@ jobs:
           password: ${{ github.token }}
 
       - name: make node
+        # Forks can read the public build cache but can't push to the
+        # upstream ghcr registry, so only pass --cache-to on the main repo.
+        env:
+          CACHE_TO: ${{ github.repository == 'streamplace/streamplace' && '--cache-to ghcr.io/streamplace/streamplace' || '' }}
         run: |
           sudo apt install podman -y
           # Ubuntu 24.04's crun (1.14.1) rejects the OCI spec version newer
@@ -59,7 +63,7 @@ jobs:
           # and the 20260726 runner image update made that pairing fatal.
           sudo curl -fsSL -o /usr/bin/crun https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-amd64
           sudo chmod +x /usr/bin/crun
-          make in-container BUILDER_TARGET=builder-no-darwin DOCKER_PWD_MOUNT_PATH=/app DOCKER_BUILD_OPTS="--layers --cache-to ghcr.io/streamplace/streamplace --cache-from ghcr.io/streamplace/streamplace" DOCKER_OPTS="-e STREAMPLACE_IGNORE_LEAKS=true -e STREAMPLACE_TEST_COUNT=1 -e CI=true -e GITHUB_ACTION=true" IN_CONTAINER_CMD="${{ matrix.cmd }}"
+          make in-container BUILDER_TARGET=builder-no-darwin DOCKER_PWD_MOUNT_PATH=/app DOCKER_BUILD_OPTS="--layers $CACHE_TO --cache-from ghcr.io/streamplace/streamplace" DOCKER_OPTS="-e STREAMPLACE_IGNORE_LEAKS=true -e STREAMPLACE_TEST_COUNT=1 -e CI=true -e GITHUB_ACTION=true" IN_CONTAINER_CMD="${{ matrix.cmd }}"
 
       - name: Publish Test Report
         if: matrix.name == 'linux-amd64' && (success() || failure())
