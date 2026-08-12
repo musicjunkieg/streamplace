@@ -74,6 +74,13 @@ export type RootStackParamList = {
   PairTV: { code?: string } | undefined;
   TVChatInput: { streamer: string };
   TVOSAuth: { code?: string } | undefined;
+
+  // tvOS-only screens (rendered by shell.tv.tsx's navigator; listed here
+  // so useNavigation()/useRoute() get types through the global
+  // RootParamList augmentation below)
+  TVHome: undefined;
+  TVStream: { user: string };
+  TVLogin: undefined;
 };
 
 // Helper type for screen props

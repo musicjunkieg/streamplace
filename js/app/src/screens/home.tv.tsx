@@ -3,6 +3,7 @@ import { Text, useStreamplaceStore } from "@streamplace/components";
 import { FocusableCard } from "components/tv/focusable-card";
 import { Image } from "expo-image";
 import { ScrollView, View } from "react-native";
+
 import type { place } from "streamplace";
 
 const COLUMNS = 3;
@@ -10,7 +11,7 @@ const GAP = 32;
 const PADDING = 80;
 
 export default function HomeTV() {
-  const navigation = useNavigation<any>();
+  const navigation = useNavigation();
   const liveUsers = useStreamplaceStore((s) => s.liveUsers);
   const loading = useStreamplaceStore((s) => s.liveUsersLoading);
   const error = useStreamplaceStore((s) => s.liveUsersError);
@@ -41,11 +42,8 @@ export default function HomeTV() {
         showsVerticalScrollIndicator={false}
       >
         {error && liveUsers?.length === 0 ? (
-          <EmptyState
-            title="Couldn't load streams"
-            subtitle={error}
-          />
-        ) : (loading && liveUsers === null) ? (
+          <EmptyState title="Couldn't load streams" subtitle={error} />
+        ) : loading && liveUsers === null ? (
           <EmptyState title="Loading…" />
         ) : liveUsers && liveUsers.length === 0 ? (
           <EmptyState
@@ -53,9 +51,12 @@ export default function HomeTV() {
             subtitle="Check back in a bit."
           />
         ) : (
-          <Grid streams={liveUsers ?? []} onPick={(handle) =>
-            navigation.navigate("TVStream", { user: handle })
-          } />
+          <Grid
+            streams={liveUsers ?? []}
+            onPick={(handle) =>
+              navigation.navigate("TVStream", { user: handle })
+            }
+          />
         )}
       </ScrollView>
     </View>
@@ -115,8 +116,7 @@ function StreamCard({
 }) {
   const record = stream.record as { title?: string } | undefined;
   const title = record?.title ?? "Live stream";
-  const author =
-    stream.author.displayName?.trim() || stream.author.handle;
+  const author = stream.author.displayName?.trim() || stream.author.handle;
   const viewers = stream.viewerCount?.count ?? 0;
 
   return (
@@ -184,13 +184,7 @@ function StreamCard({
   );
 }
 
-function EmptyState({
-  title,
-  subtitle,
-}: {
-  title: string;
-  subtitle?: string;
-}) {
+function EmptyState({ title, subtitle }: { title: string; subtitle?: string }) {
   return (
     <View style={{ alignItems: "center", marginTop: 120 }}>
       <Text style={{ color: "#fff", fontSize: 32, fontWeight: "600" }}>

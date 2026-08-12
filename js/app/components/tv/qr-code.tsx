@@ -58,9 +58,7 @@ export function QRCode({
         style,
       ]}
     >
-      {svg ? (
-        <SvgXml xml={svg} width={size} height={size} />
-      ) : null}
+      {svg ? <SvgXml xml={svg} width={size} height={size} /> : null}
     </View>
   );
 }

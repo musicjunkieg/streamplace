@@ -1,9 +1,10 @@
-import { useNavigation, useRoute } from "@react-navigation/native";
+import { useRoute } from "@react-navigation/native";
 import { Text, useStreamplaceStore, useUrl } from "@streamplace/components";
 import LoginForm from "components/login/login-form";
 import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Pressable, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import type { RootStackParamList } from "src/navigation-types";
 import { useStore } from "store";
 import { completeBrowser, SessionBundle } from "../../lib/tvos-auth";
 
@@ -20,8 +21,7 @@ type Phase =
   | { kind: "error"; message: string };
 
 export default function TVOSAuth() {
-  const navigation = useNavigation<any>();
-  const route = useRoute<any>();
+  const route = useRoute<RootStackParamList, "TVOSAuth">("TVOSAuth");
   const serverUrl = useUrl();
   const oauthSession = useStreamplaceStore((s) => s.oauthSession);
   const authStatus = useStore((s) => s.authStatus);
@@ -29,10 +29,7 @@ export default function TVOSAuth() {
   const code: string | undefined = route.params?.code;
   const [phase, setPhase] = useState<Phase>({ kind: "waiting-login" });
 
-  const trimmedCode = useMemo(
-    () => (code ?? "").trim().toUpperCase(),
-    [code],
-  );
+  const trimmedCode = useMemo(() => (code ?? "").trim().toUpperCase(), [code]);
 
   // Once the user is logged in (which sets `oauthSession` in the
   // store), automatically submit the bundle.
@@ -74,9 +71,7 @@ export default function TVOSAuth() {
   return (
     <SafeAreaView style={{ flex: 1 }}>
       <Pane>
-        <Text style={{ fontSize: 28, fontWeight: "700" }}>
-          Pair Apple TV
-        </Text>
+        <Text style={{ fontSize: 28, fontWeight: "700" }}>Pair Apple TV</Text>
         <Text style={{ fontSize: 15, opacity: 0.7, marginTop: 8 }}>
           Pairing code:{" "}
           <Text style={{ fontWeight: "700", letterSpacing: 2 }}>
@@ -84,7 +79,9 @@ export default function TVOSAuth() {
           </Text>
         </Text>
 
-        <View style={{ height: 1, backgroundColor: "#1a1a22", marginVertical: 24 }} />
+        <View
+          style={{ height: 1, backgroundColor: "#1a1a22", marginVertical: 24 }}
+        />
 
         {phase.kind === "waiting-login" && authStatus !== "loggedIn" ? (
           <View>
@@ -154,29 +151,22 @@ export default function TVOSAuth() {
 }
 
 function Pane({ children }: { children: React.ReactNode }) {
-  return (
-    <View style={{ flex: 1, padding: 24 }}>
-      {children}
-    </View>
-  );
+  return <View style={{ flex: 1, padding: 24 }}>{children}</View>;
 }
 
 // Same shape as `pair-tv.tsx` — kept duplicated rather than imported so
 // the two screens can evolve independently as the underlying OAuth
 // client shape changes between web and native.
-async function extractBundle(
-  oauthSession: unknown,
-): Promise<SessionBundle> {
+async function extractBundle(oauthSession: unknown): Promise<SessionBundle> {
   const s = oauthSession as Record<string, any>;
   const sub: string | undefined = s.sub ?? s.did;
   if (!sub) throw new Error("Active session is missing a DID");
   const tokenSet = s.tokenSet ?? s.session?.tokenSet ?? s;
   const dpopKey = s.dpopKey ?? s.session?.dpopKey;
-  const accessToken =
-    tokenSet?.access_token ?? tokenSet?.accessToken;
-  if (!accessToken) throw new Error("Active session is missing an access token");
-  const refreshToken =
-    tokenSet?.refresh_token ?? tokenSet?.refreshToken ?? "";
+  const accessToken = tokenSet?.access_token ?? tokenSet?.accessToken;
+  if (!accessToken)
+    throw new Error("Active session is missing an access token");
+  const refreshToken = tokenSet?.refresh_token ?? tokenSet?.refreshToken ?? "";
   const expiresAtRaw =
     tokenSet?.expires_at ?? tokenSet?.accessTokenExpiresAt ?? 0;
   const tokenEndpoint =
@@ -196,7 +186,9 @@ async function extractBundle(
     did: sub,
     accessToken,
     accessTokenExpiresAt:
-      typeof expiresAtRaw === "number" ? expiresAtRaw : Date.parse(expiresAtRaw),
+      typeof expiresAtRaw === "number"
+        ? expiresAtRaw
+        : Date.parse(expiresAtRaw),
     refreshToken,
     tokenEndpoint,
     dpopKey: dpopJwk,

@@ -1,12 +1,8 @@
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { Text, useStreamplaceStore, useUrl } from "@streamplace/components";
-import { useEffect, useMemo, useState } from "react";
-import {
-  ActivityIndicator,
-  Pressable,
-  TextInput,
-  View,
-} from "react-native";
+import { useMemo, useState } from "react";
+import { ActivityIndicator, Pressable, TextInput, View } from "react-native";
+import type { RootStackParamList } from "src/navigation-types";
 import { completeMobile, SessionBundle } from "../../lib/tvos-auth";
 
 // Reuses the phone's currently-active ATProto session to complete a TV
@@ -16,7 +12,7 @@ import { completeMobile, SessionBundle } from "../../lib/tvos-auth";
 
 export default function PairTV() {
   const navigation = useNavigation();
-  const route = useRoute<any>();
+  const route = useRoute<RootStackParamList, "PairTV">("PairTV");
   const serverUrl = useUrl();
   const oauthSession = useStreamplaceStore((s) => s.oauthSession);
 
@@ -139,9 +135,7 @@ function Pane({ children }: { children: React.ReactNode }) {
 // just enough for the receiving TV to reconstruct an authenticated
 // agent; refresh continues to work because the DPoP private key
 // travels with the bundle.
-async function extractBundle(
-  oauthSession: unknown,
-): Promise<SessionBundle> {
+async function extractBundle(oauthSession: unknown): Promise<SessionBundle> {
   // `@atproto/oauth-client` Session shape — fields are read defensively
   // because the underlying class differs slightly between browser and
   // expo OAuth client implementations.
@@ -155,10 +149,8 @@ async function extractBundle(
   if (!tokenSet?.access_token && !tokenSet?.accessToken) {
     throw new Error("Active session is missing an access token");
   }
-  const accessToken =
-    tokenSet.access_token ?? tokenSet.accessToken;
-  const refreshToken =
-    tokenSet.refresh_token ?? tokenSet.refreshToken ?? "";
+  const accessToken = tokenSet.access_token ?? tokenSet.accessToken;
+  const refreshToken = tokenSet.refresh_token ?? tokenSet.refreshToken ?? "";
   const expiresAtRaw =
     tokenSet.expires_at ?? tokenSet.accessTokenExpiresAt ?? 0;
   const tokenEndpoint =
@@ -181,7 +173,9 @@ async function extractBundle(
     did: sub,
     accessToken,
     accessTokenExpiresAt:
-      typeof expiresAtRaw === "number" ? expiresAtRaw : Date.parse(expiresAtRaw),
+      typeof expiresAtRaw === "number"
+        ? expiresAtRaw
+        : Date.parse(expiresAtRaw),
     refreshToken,
     tokenEndpoint,
     dpopKey: dpopJwk,

@@ -9,15 +9,16 @@ import { QRCode } from "components/tv/qr-code";
 import { useVideoPlayer, VideoView } from "expo-video";
 import { useEffect, useMemo, useState } from "react";
 import { Pressable, View } from "react-native";
+import type { RootStackParamList } from "src/navigation-types";
 
 const PLAYER_BG = "#000";
 const SIDEBAR_BG = "#0e0e12";
 const SIDEBAR_WIDTH = 460;
 
 export default function StreamTV() {
-  const route = useRoute<any>();
+  const route = useRoute<RootStackParamList, "TVStream">("TVStream");
   const navigation = useNavigation();
-  const user: string = route.params?.user;
+  const user = route.params?.user;
 
   if (!user) {
     return <Center>No stream specified.</Center>;
@@ -69,7 +70,6 @@ function PlayerPane({ user }: { user: string }) {
         style={{ flex: 1 }}
         contentFit="contain"
         nativeControls={true}
-        allowsFullscreen={false}
       />
     </View>
   );

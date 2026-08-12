@@ -3,6 +3,7 @@ import { Text, useUrl } from "@streamplace/components";
 import { QRCode } from "components/tv/qr-code";
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, View } from "react-native";
+
 import {
   awaitTVAuth,
   persistBundle,
@@ -18,7 +19,7 @@ type Phase =
   | { kind: "failed"; message: string };
 
 export default function LoginTV() {
-  const navigation = useNavigation<any>();
+  const navigation = useNavigation();
   const serverUrl = useUrl();
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const abortRef = useRef<AbortController | null>(null);
@@ -70,9 +71,10 @@ export default function LoginTV() {
             lineHeight: 32,
           }}
         >
-          Scan the QR with your phone, or open Streamplace on your phone and
-          tap{" "}
-          <Text style={{ color: "#fff", fontWeight: "600" }}>Pair Apple TV</Text>
+          Scan the QR with your phone, or open Streamplace on your phone and tap{" "}
+          <Text style={{ color: "#fff", fontWeight: "600" }}>
+            Pair Apple TV
+          </Text>
           .
         </Text>
 

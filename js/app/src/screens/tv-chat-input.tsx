@@ -8,6 +8,7 @@ import {
 import { useEffect, useState } from "react";
 import { View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import type { RootStackParamList } from "src/navigation-types";
 
 // Deep-link target on the phone for "type as the TV's chat keyboard".
 //   streamplace://tv-chat-input/<handle>
@@ -17,8 +18,8 @@ import { SafeAreaView } from "react-native-safe-area-context";
 // websocket every other client uses.
 
 export default function TVChatInput() {
-  const route = useRoute<any>();
-  const streamer: string = route.params?.streamer;
+  const route = useRoute<RootStackParamList, "TVChatInput">("TVChatInput");
+  const streamer = route.params?.streamer;
   const did = useDID();
   const [emojiData, setEmojiData] = useState<any>(null);
 
@@ -33,16 +34,15 @@ export default function TVChatInput() {
     return <Centered>No streamer specified.</Centered>;
   }
   if (!did) {
-    return (
-      <Centered>
-        Sign in on this device before using TV chat.
-      </Centered>
-    );
+    return <Centered>Sign in on this device before using TV chat.</Centered>;
   }
 
   return (
     <LivestreamProvider src={streamer}>
-      <SafeAreaView style={{ flex: 1, backgroundColor: "#0b0b0e" }} edges={["bottom"]}>
+      <SafeAreaView
+        style={{ flex: 1, backgroundColor: "#0b0b0e" }}
+        edges={["bottom"]}
+      >
         <View
           style={{
             paddingHorizontal: 20,
@@ -60,11 +60,7 @@ export default function TVChatInput() {
         </View>
 
         <View style={{ flex: 1, justifyContent: "flex-end", padding: 16 }}>
-          <ChatBox
-            emojiData={emojiData}
-            hideLogin
-            isPopout
-          />
+          <ChatBox emojiData={emojiData} hideLogin isPopout />
         </View>
       </SafeAreaView>
     </LivestreamProvider>

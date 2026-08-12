@@ -1,15 +1,15 @@
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { useDID } from "@streamplace/components";
 import { View } from "react-native";
+import type { RootStackParamList } from "src/navigation-types";
 import HomeTV from "src/screens/home.tv";
 import LoginTV from "src/screens/login.tv";
 import StreamTV from "src/screens/stream.tv";
 
-export type TVStackParamList = {
-  TVHome: undefined;
-  TVStream: { user: string };
-  TVLogin: undefined;
-};
+type TVStackParamList = Pick<
+  RootStackParamList,
+  "TVHome" | "TVStream" | "TVLogin"
+>;
 
 const Stack = createNativeStackNavigator<TVStackParamList>();
 

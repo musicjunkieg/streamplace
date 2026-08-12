@@ -55,7 +55,9 @@ jobs:
         # Forks can read the public build cache but can't push to the
         # upstream ghcr registry, so only pass --cache-to on the main repo.
         env:
-          CACHE_TO: ${{ github.repository == 'streamplace/streamplace' && '--cache-to ghcr.io/streamplace/streamplace' || '' }}
+          CACHE_TO:
+            ${{ github.repository == 'streamplace/streamplace' && '--cache-to
+            ghcr.io/streamplace/streamplace' || '' }}
         run: |
           sudo apt install podman -y
           # Ubuntu 24.04's crun (1.14.1) rejects the OCI spec version newer
