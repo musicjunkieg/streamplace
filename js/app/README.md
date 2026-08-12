@@ -66,6 +66,39 @@ opens a fullscreen chat composer scoped to that streamer
 (`src/screens/tv-chat-input.tsx`). Messages flow through the existing
 ATProto + websocket plumbing — no new server work needed for chat.
 
+### Deploying your own node for TV testing
+
+The `tvos-auth` endpoints are not on stream.place (yet), so login needs a
+node built from this branch. The dependency map:
+
+| Feature                         | Works against stream.place? | Needs custom node | Needs new mobile build |
+| ------------------------------- | --------------------------- | ----------------- | ---------------------- |
+| Anonymous browse + HLS playback | yes                         |                   |                        |
+| Chat display on TV              | yes                         |                   |                        |
+| Chat posting from phone         | yes (goes via your PDS)     |                   |                        |
+| QR login (`/auth/tv`)           |                             | yes               |                        |
+| In-app "Pair Apple TV"          |                             | yes               | yes                    |
+| `tv-chat-input` deep link       |                             |                   | yes                    |
+
+Notes:
+
+- The `/auth/tv` web page ships **inside the node binary** — the web
+  frontend is embedded from `js/app/dist` (`js/app/app.go`) — so a node
+  built from this branch serves both the pairing API and the browser
+  page. One artifact covers the whole QR flow.
+- **Build the node on a Mac.** `make` from this branch is CI-verified on
+  macOS (darwin-arm64). The Linux build currently trips a pre-existing
+  glib/pcre2 meson subproject issue when configured from a cold cache;
+  it is unrelated to the tvOS work but makes Linux the harder path.
+- For local testing, `make dev` boots a node at `http://127.0.0.1:38080`.
+  Dev app builds already point there (`.env.development`); the tvOS
+  Simulator on the same Mac reaches it directly. A physical Apple TV
+  needs your Mac's LAN IP — use Settings → Advanced → custom node URL,
+  or bake it in with `EXPO_PUBLIC_STREAMPLACE_URL` at build time.
+- The TV pulls its live-streams grid from whatever node it points at. A
+  fresh self-hosted node discovers streams via ATProto sync, so its grid
+  can differ from stream.place's — expected, not a bug.
+
 ### What still doesn't work (known leftovers)
 
 - **Full session rehydration on the TV.** The TV persists the session
