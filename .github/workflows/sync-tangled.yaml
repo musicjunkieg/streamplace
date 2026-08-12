@@ -5,6 +5,8 @@ on:
 
 jobs:
   sync:
+    # Mirror push needs upstream's TANGLED_SSH_KEY secret; skip on forks.
+    if: github.repository == 'streamplace/streamplace'
     name: ${{ matrix.name }}
     runs-on: ubuntu-slim
     steps:

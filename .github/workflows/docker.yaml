@@ -38,6 +38,9 @@ jobs:
   # docker/build.Dockerfile is a fast cache hit.
   builder:
     name: builder image
+    # Skipped on forks: exists to feed the linux-binaries/image jobs,
+    # which need the warm upstream build cache. Upstream runs it.
+    if: github.repository == 'streamplace/streamplace'
     runs-on: ubuntu-latest
     steps:
       - name: Maximize build space
@@ -88,6 +91,9 @@ jobs:
   # mechanism as build.yaml) and hand them to the image jobs as an artifact.
   binaries:
     name: linux binaries
+    # Skipped on forks: cold-cache meson configure of the native
+    # toolchain doesn't currently succeed outside upstream's cache.
+    if: github.repository == 'streamplace/streamplace'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

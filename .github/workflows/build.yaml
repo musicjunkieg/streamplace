@@ -13,6 +13,10 @@ concurrency:
 jobs:
   linux:
     name: ${{ matrix.name }}
+    # Skipped on forks: the linux targets need the warm upstream build
+    # cache to configure meson, and windows/android aren't part of fork
+    # validation. Upstream runs the full matrix.
+    if: github.repository == 'streamplace/streamplace'
     runs-on: ubuntu-latest
     strategy:
       matrix:
