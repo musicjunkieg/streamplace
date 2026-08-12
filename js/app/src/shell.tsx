@@ -2,7 +2,7 @@ import {
   BottomTabIcon,
   createBottomTabNavigator,
 } from "@react-navigation/bottom-tabs";
-import { useLinkTo, useNavigation } from "@react-navigation/native";
+import { useLinkTo } from "@react-navigation/native";
 import {
   createNativeStackNavigator,
   NativeStackHeaderBackProps,
@@ -14,7 +14,6 @@ import {
   usePrimaryColor,
   useSiteTitle,
   useTheme,
-  useToast,
   zero,
 } from "@streamplace/components";
 import { Settings } from "components";
@@ -28,21 +27,23 @@ import { AdvancedCategorySettings } from "components/settings/advanced-category-
 import { BackupSettings } from "components/settings/backup-settings";
 import { BadgeIssuerPanel } from "components/settings/badge-issuer-panel";
 import { BadgeSelectionManager } from "components/settings/badge-selection-manager";
+import { BrandingAdmin } from "components/settings/branding-admin";
 import { DanmuCategorySettings } from "components/settings/danmu-category-settings";
 import KeyManager from "components/settings/key-manager";
 import { LanguagesCategorySettings } from "components/settings/languages-category-settings";
 import MultistreamManager from "components/settings/multistream-manager";
+import { NotificationsCategorySettings } from "components/settings/notifications-category-settings";
 import { PrivacyCategorySettings } from "components/settings/privacy-category-settings";
 import RecommendationsManager from "components/settings/recommendations-manager";
 import { StreamingCategorySettings } from "components/settings/streaming-category-settings";
 import WebhookManager from "components/settings/webhook-manager";
 import { SidebarOverlay } from "components/sidebar/sidebar-overlay";
+import UploadProgressIndicator from "components/upload/upload-progress-indicator";
 import { useBlueskyNotifications } from "hooks/useBlueskyNotifications";
-import { useLiveUser } from "hooks/useLiveUser";
 import usePlatform from "hooks/usePlatform";
 import { useIsLargeScreen, useSidebarControl } from "hooks/useSidebarControl";
-import { Cog, Home, Video } from "lucide-react-native";
-import { useEffect, useRef, useState } from "react";
+import { Clapperboard, Cog, Home, Video } from "lucide-react-native";
+import { useEffect } from "react";
 import { Platform, StatusBar, View } from "react-native";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import { SFSymbols7_0 } from "sf-symbols-typescript";
@@ -65,17 +66,33 @@ import PopoutLivestream from "src/screens/popout-livestream";
 import PopoutMultistream from "src/screens/popout-multistream";
 import PopoutStreamMonitor from "src/screens/popout-stream-monitor";
 import SupportScreen from "src/screens/support";
+import UploadScreen, {
+  UploadDraftsScreen,
+  UploadLivestreamsScreen,
+  UploadVideoScreen,
+  UploadVideosScreen,
+} from "src/screens/upload";
+import VideoScreen from "src/screens/video";
+import VideoListScreen from "src/screens/video-list";
+import VodScreen from "src/screens/vod";
+import VodEmbedScreen from "src/screens/vod-embed";
 import { useStore } from "store";
 import {
   useHydrated,
   useNotificationDestination,
   useNotificationToken,
 } from "store/hooks";
-import { AvatarButton, LGAvatarButton, NavigationButton } from "./router";
+import {
+  AvatarButton,
+  LGAvatarButton,
+  NavigationButton,
+  UploadButton,
+} from "./router";
 
 const Tab = createBottomTabNavigator();
 const RootStack = createNativeStackNavigator();
 const HomeStack = createNativeStackNavigator();
+const VideosStack = createNativeStackNavigator();
 const SettingsStack = createNativeStackNavigator();
 
 function useBaseScreenOptions() {
@@ -110,7 +127,12 @@ function HomeNavigator() {
       : ({ canGoBack }: NativeStackHeaderBackProps) => (
           <NavigationButton canGoBack={canGoBack} />
         ),
-    headerRight: () => <LGAvatarButton />,
+    headerRight: () => (
+      <View style={{ flexDirection: "row", alignItems: "center" }}>
+        <UploadButton />
+        <LGAvatarButton />
+      </View>
+    ),
     ...(isNative && {
       headerTransparent: true,
     }),
@@ -140,13 +162,23 @@ function HomeNavigator() {
             Platform.OS !== "ios"
               ? ({ canGoBack }) => <NavigationButton canGoBack={canGoBack} />
               : undefined,
-          headerRight: () => <AvatarButton />,
+          headerRight: () => (
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <UploadButton />
+              <AvatarButton />
+            </View>
+          ),
           ...(Platform.OS === "ios" && {
             unstable_headerRightItems: () => [
               {
                 type: "custom",
                 hidesSharedBackground: true,
-                element: <LGAvatarButton />,
+                element: (
+                  <View style={{ flexDirection: "row", alignItems: "center" }}>
+                    <UploadButton />
+                    <LGAvatarButton />
+                  </View>
+                ),
               },
             ],
           }),
@@ -185,7 +217,83 @@ function HomeNavigator() {
         component={SupportScreen}
         options={{ title: "Support", ...headerScreenOptions }}
       />
+      {!isNative && (
+        <HomeStack.Screen
+          name="Upload"
+          component={UploadScreen}
+          options={{ title: "Upload Video", ...headerScreenOptions }}
+        />
+      )}
+      {!isNative && (
+        <HomeStack.Screen
+          name="UploadVideo"
+          component={UploadVideoScreen}
+          options={{ title: "Edit Video", ...headerScreenOptions }}
+        />
+      )}
+      {!isNative && (
+        <HomeStack.Screen
+          name="UploadDrafts"
+          component={UploadDraftsScreen}
+          options={{ title: "Drafts", ...headerScreenOptions }}
+        />
+      )}
+      {!isNative && (
+        <HomeStack.Screen
+          name="UploadLivestreams"
+          component={UploadLivestreamsScreen}
+          options={{ title: "Livestreams", ...headerScreenOptions }}
+        />
+      )}
+      {!isNative && (
+        <HomeStack.Screen
+          name="UploadVideos"
+          component={UploadVideosScreen}
+          options={{ title: "My Videos", ...headerScreenOptions }}
+        />
+      )}
     </HomeStack.Navigator>
+  );
+}
+
+// Videos stack navigator (global + per-user VOD listings). Unlike the pushed
+// Home screens, these are tab roots, so they always carry their own header.
+function VideosNavigator() {
+  const baseScreenOptions = useBaseScreenOptions();
+  const isNative = Platform.OS !== "web";
+  const z = useTheme();
+
+  return (
+    <VideosStack.Navigator
+      screenOptions={{
+        ...baseScreenOptions,
+        headerLeft: isNative
+          ? undefined
+          : ({ canGoBack }: NativeStackHeaderBackProps) => (
+              <NavigationButton canGoBack={canGoBack} />
+            ),
+        headerRight: () => (
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <UploadButton />
+            <LGAvatarButton />
+          </View>
+        ),
+        headerTitleStyle: {
+          fontFamily: z.theme.typography.universal.base.fontFamily,
+        },
+      }}
+    >
+      <VideosStack.Screen
+        name="VideoList"
+        component={VideoListScreen}
+        options={{ title: "Videos" }}
+      />
+      <VideosStack.Screen
+        name="UserVideoList"
+        component={VideoListScreen}
+        options={{ title: "Videos" }}
+      />
+    </VideosStack.Navigator>
   );
 }
 
@@ -195,26 +303,28 @@ function SettingsNavigator() {
   const z = useTheme();
   const isNative = Platform.OS !== "web";
   const headerScreenOptions = {
+    ...baseScreenOptions,
+    headerTransparent: Platform.OS === "ios",
+    headerBackButtonDisplayMode: "minimal" as const,
     headerShown: true,
-    headerLeft: isNative
-      ? undefined
-      : ({ canGoBack }: NativeStackHeaderBackProps) => (
-          <NavigationButton canGoBack={canGoBack} />
-        ),
-    headerRight: () => <LGAvatarButton />,
-    ...(isNative && {
-      headerTransparent: true,
-    }),
-    headerTitleStyle: {
-      fontFamily: z.theme.typography.universal.base.fontFamily,
-    },
+    // headerLeft: isNative
+    //   ? undefined
+    //   : ({ canGoBack }: NativeStackHeaderBackProps) => (
+    //       <NavigationButton canGoBack={canGoBack} />
+    //     ),
+    // headerRight: () => <LGAvatarButton />,
+    // ...(isNative && {
+    //   headerTransparent: true,
+    // }),
+    // headerTitleStyle: {
+    //   fontFamily: z.theme.typography.universal.base.fontFamily,
+    //   marginBottom: 100,
+    // },
   };
   return (
     <SettingsStack.Navigator
       initialRouteName="MainSettings"
       screenOptions={{
-        headerTransparent: Platform.OS === "ios",
-        headerBackButtonDisplayMode: "minimal",
         ...headerScreenOptions,
       }}
     >
@@ -259,6 +369,11 @@ function SettingsNavigator() {
         options={{ title: "Privacy & Security" }}
       />
       <SettingsStack.Screen
+        name="NotificationsCategory"
+        component={NotificationsCategorySettings}
+        options={{ title: "Notifications" }}
+      />
+      <SettingsStack.Screen
         name="DanmuCategory"
         component={DanmuCategorySettings}
         options={{ title: "Danmu" }}
@@ -293,17 +408,24 @@ function SettingsNavigator() {
         component={BadgeIssuerPanel}
         options={{ title: "Issue Badges" }}
       />
+      <SettingsStack.Screen
+        name="BrandingAdmin"
+        component={BrandingAdmin}
+        options={{ title: "Branding" }}
+      />
     </SettingsStack.Navigator>
   );
 }
 
 const IOS_ICONS: Record<string, SFSymbols7_0> = {
   Home: "house.fill",
+  Videos: "play.rectangle.fill",
   GoLive: "video.fill",
   Settings: "gearshape.fill",
 };
 const ANDROID_ICONS = {
   Home: "home",
+  Videos: "video_library",
   GoLive: "videocam",
   Settings: "settings",
 };
@@ -369,6 +491,22 @@ function TabNavigator() {
         }}
       />
       <Tab.Screen
+        name="VideosTab"
+        component={VideosNavigator}
+        options={{
+          title: "Videos",
+          ...(isNative
+            ? {
+                tabBarIcon: getIcon("Videos"),
+              }
+            : {
+                tabBarIcon: ({ color, size }) => (
+                  <Clapperboard size={size} color={color} />
+                ),
+              }),
+        }}
+      />
+      <Tab.Screen
         name="GoLiveTab"
         component={LaunchGoLive}
         options={{
@@ -410,7 +548,6 @@ function TabNavigator() {
 export default function Shell() {
   const { isNative } = usePlatform();
   const sidebar = useSidebarControl();
-  const navigation = useNavigation();
   const hydrate = useStore((state) => state.hydrate);
   const initPushNotifications = useStore(
     (state) => state.initPushNotifications,
@@ -427,10 +564,7 @@ export default function Shell() {
   const closePdsModal = useStore((state) => state.closePdsModal);
   const loginAction = useStore((state) => state.login);
   const openLoginLink = useStore((state) => state.openLoginLink);
-  const livePopupShown = useRef(false);
   const z = useTheme();
-
-  const toast = useToast();
 
   // Top-level hydration and initialization
   useEffect(() => {
@@ -439,13 +573,18 @@ export default function Shell() {
   }, []);
 
   const notificationToken = useNotificationToken();
+  const did = useStore((state) => state.oauthSession?.did);
   const hydrated = useHydrated();
 
+  // Re-register when the token changes OR once the logged-in DID resolves, so a
+  // token acquired before the OAuth session finishes restoring still gets its
+  // repoDID association registered (otherwise the user is excluded from
+  // follower livestream notifications).
   useEffect(() => {
     if (notificationToken) {
       registerNotificationToken();
     }
-  }, [notificationToken]);
+  }, [notificationToken, did]);
 
   // Handle incoming push notification routing
   const notificationDestination = useNotificationDestination();
@@ -468,52 +607,7 @@ export default function Shell() {
     return () => clearInterval(handle);
   }, []);
 
-  const userIsLive = useLiveUser();
   useBlueskyNotifications();
-
-  // Track current route
-  const [currentRouteName, setCurrentRouteName] = useState<
-    string | undefined
-  >();
-
-  useEffect(() => {
-    const unsubscribe = navigation.addListener("state", () => {
-      const state = navigation.getState();
-      if (state?.routes) {
-        const currentRoute = state.routes[state.index];
-        console.log("setCurrentRouteName", currentRoute?.name);
-        setCurrentRouteName(currentRoute?.name);
-      }
-    });
-    return unsubscribe;
-  }, [navigation]);
-
-  const noLivePopupRoutes =
-    currentRouteName === "LiveDashboard" ||
-    currentRouteName === "GoLiveTab" ||
-    currentRouteName === "MobileGoLive";
-
-  // Show "You are live!" toast once per live session
-  useEffect(() => {
-    if (!userIsLive) {
-      livePopupShown.current = false;
-      return;
-    }
-    if (!noLivePopupRoutes && !livePopupShown.current) {
-      livePopupShown.current = true;
-      toast.show("You are live!", "Do you want to go to your Live Dashboard?", {
-        actionLabel: "Go",
-        onAction: () => {
-          navigation.navigate("MainTabs" as any, {
-            screen: "HomeTab",
-            params: { screen: "LiveDashboard" },
-          });
-        },
-        variant: "error",
-        duration: 8,
-      });
-    }
-  }, [userIsLive, noLivePopupRoutes]);
 
   // Animate content margin when sidebar is active (web only)
   const animatedContentStyle = useAnimatedStyle(() => {
@@ -541,12 +635,20 @@ export default function Shell() {
             headerLeft: ({ canGoBack }) => (
               <NavigationButton canGoBack={canGoBack} />
             ),
-            headerRight: () => <LGAvatarButton />,
+            headerRight: () => (
+              <View style={{ flexDirection: "row", alignItems: "center" }}>
+                <UploadButton />
+                <LGAvatarButton />
+              </View>
+            ),
             ...(isNative && {
               headerTransparent: true,
             }),
             headerTitleStyle: {
               fontFamily: z.theme.typography.universal.base.fontFamily,
+            },
+            headerStyle: {
+              backgroundColor: z.theme.colors.background,
             },
           }}
         >
@@ -571,6 +673,16 @@ export default function Shell() {
             component={MobileGoLive}
             options={{ headerShown: false }}
           />
+          <RootStack.Screen
+            name="Video"
+            component={VideoScreen}
+            options={{ headerShown: false }}
+          />
+          <RootStack.Screen
+            name="Vod"
+            component={VodScreen}
+            options={{ headerShown: false }}
+          />
 
           {/* Utility/embed screens */}
           <RootStack.Screen
@@ -586,6 +698,11 @@ export default function Shell() {
           <RootStack.Screen
             name="Embed"
             component={EmbedScreen}
+            options={{ headerShown: false }}
+          />
+          <RootStack.Screen
+            name="VodEmbed"
+            component={VodEmbedScreen}
             options={{ headerShown: false }}
           />
           <RootStack.Screen
@@ -633,6 +750,7 @@ export default function Shell() {
           loginAction(pdsHost, openLoginLink);
         }}
       />
+      <UploadProgressIndicator />
     </View>
   );
 }

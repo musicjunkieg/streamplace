@@ -32,11 +32,13 @@ import (
 	"stream.place/streamplace/pkg/integrations/discord/discordtypes"
 	"stream.place/streamplace/pkg/log"
 	"stream.place/streamplace/pkg/moderation"
-	placestream "stream.place/streamplace/pkg/streamplace"
+	placestream "stream.place/streamplace/pkg/placestream"
+	"stream.place/streamplace/pkg/s3"
 )
 
 const SPDataDir = "$SP_DATA_DIR"
 const SegmentsDir = "segments"
+const ThumbnailsDir = "thumbnails"
 
 type BuildFlags struct {
 	Version   string
@@ -74,6 +76,7 @@ type CLI struct {
 	RTMPSAddonAddr              string
 	Secure                      bool
 	NoMist                      bool
+	IsolatedIngest              bool
 	MistAdminPort               int
 	MistHTTPPort                int
 	MistRTMPPort                int
@@ -120,7 +123,6 @@ type CLI struct {
 	ServiceAuthKey              jwk.Key
 	dataDirFlags                []*string
 	DiscordWebhooks             []*discordtypes.Webhook
-	NewWebRTCPlayback           bool
 	AppleTeamID                 string
 	AndroidCertFingerprint      string
 	Labelers                    []string
@@ -155,14 +157,96 @@ type CLI struct {
 	S3AccessKeyID               string
 	S3SecretAccessKey           string
 	S3Region                    string
+	VODCDNURL                   string
 	DisableSyndication          bool
-	LegacySegmentation          bool
 	MuxlInitialMemoryMB         int
 	MuxlMaxMemoryMB             int
 	GamesAPIURL                 string
 	GamesAPIClientKey           string
 	GamesAPIClientSecret        string
+	BetaInviteDID               string
+	ViewLogFlushInterval        time.Duration
+	ViewCountAggregateInterval  time.Duration
+	ViewCountAggregateLag       time.Duration
+	VODConcurrency              int
+	MaximumLiveBitrate          int
+	SweepConcurrency            int
+	SweepInterval               time.Duration
+	SweepBootDelay              time.Duration
+	DeepenRate                  int
+	FirehoseReplayWindow        time.Duration
+	IndexDBConnections          int
 }
+
+// DefaultSweepInterval is how often the atproto sweep re-runs when
+// --sweep-interval is unset.
+//
+// The sweep's first pass over a repo that is up to date is a single
+// getLatestCommit, so this is a per-repo request budget: six hours means an
+// indexed account is asked about four times a day, and drift -- a gap in the
+// firehose, a span missed while this node was down -- is found and repaired
+// within that. Any lower buys hours of detection latency for a proportional
+// increase in traffic against every PDS on the network.
+const DefaultSweepInterval = 6 * time.Hour
+
+// DefaultSweepConcurrency is how many PDS hosts the atproto backfill sweep
+// works on at once when --sweep-concurrency is unset or zero.
+//
+// The sweep shards its work by host and gives each host one worker, so this
+// bounds remote servers rather than repos: 32 of them is a few hundred requests
+// per second spread across the whole network, and no more than one walk (5-7
+// requests per second) against any single PDS.
+const DefaultSweepConcurrency = 32
+
+// DefaultDeepenRate is how many history windows a node walks per minute when
+// --deepen-rate is unset.
+//
+// History acquisition is the one part of the sync engine nothing waits for: a
+// repo's recent records are indexed by its shallow sync in seconds, and
+// everything older is a background trickle. Running it flat out is what a node
+// does exactly once -- at boot, where it replays years of every account's chat
+// as fast as the network allows and buries the reconciliation the node actually
+// serves from. So it is paced instead: 60 windows a minute is one window a
+// second across the whole node, which a fresh 20k-repo index's full history
+// (four to five windows a repo, 100k of them) trickles in over roughly a day.
+// Deliberately: nothing is waiting for it. 0 removes the cap entirely, which is
+// what an operator uses to rush an initial build in place; negative means this
+// default.
+const DefaultDeepenRate = 60
+
+// DefaultFirehoseReplayWindow is how stale a stored relay cursor may be before
+// this node stops trying to replay from it and tails the live edge instead.
+//
+// The firehose is a latency optimization, not the sync engine: the sweep's head
+// check asks every repo's host one question and repairs the ones that have
+// drifted, so a gap of hours costs a few thousand cheap requests spread across
+// hundreds of hosts. Replaying that same gap costs the relay a full-rate flood
+// of every commit on the network -- including the overwhelming majority from
+// repos this node has never heard of -- which is how a two-hour-old cursor once
+// buried a node under millions of queued events. Fifteen minutes is long enough
+// to cover an ordinary restart or deploy, where replay genuinely is the cheaper
+// answer, and short enough that anything worse is handed to the mechanism built
+// for it. 0 disables the cap and always replays from the stored cursor.
+const DefaultFirehoseReplayWindow = 15 * time.Minute
+
+// DefaultIndexDBConnections is how many sqlite connections the index database
+// pool holds. See --index-db-connections; 1 is the fallback to the historical
+// single-connection arrangement.
+const DefaultIndexDBConnections = 8
+
+// DefaultSweepBootDelay is how long a warm-index boot holds its first sweep
+// (and the deepener's first scan). An ordinary upgrade-restart's gap is healed
+// by the firehose replaying from the stored cursor, so the boot sweep is
+// insurance, not repair -- it only needs to wait out the restart churn itself:
+// streams reconnecting, the replay catching up, caches warming. Two minutes
+// does that. Deliberately NOT longer: with deepening rate-capped and sweep
+// passes reduced to checks and repairs, the pass is either harmless -- in
+// which case it may as well run while the operator who just deployed is still
+// watching the graphs -- or it is a problem, and a longer delay only schedules
+// the problem for the moment they have stopped looking. A fresh index sweeps
+// immediately regardless, and a cursor too stale to replay kicks its own
+// sweep, so the cases that genuinely need boot-time sweeping keep it.
+const DefaultSweepBootDelay = 2 * time.Minute
 
 // ContentFilters represents the content filtering configuration
 type ContentFilters struct {
@@ -222,6 +306,13 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 				Value:       false,
 				Destination: &cli.Secure,
 				Sources:     urfavecli.EnvVars("SP_SECURE"),
+			},
+			&urfavecli.BoolFlag{
+				Name:        "isolated-ingest",
+				Usage:       "Run each MKV/RTMP-push ingest in an isolated worker subprocess (fault isolation)",
+				Value:       true,
+				Destination: &cli.IsolatedIngest,
+				Sources:     urfavecli.EnvVars("SP_ISOLATED_INGEST"),
 			},
 			&urfavecli.StringFlag{
 				Name:        "tls-cert",
@@ -492,7 +583,7 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 			},
 			&urfavecli.StringFlag{
 				Name:        "relay-host",
-				Usage:       "websocket url for relay firehose",
+				Usage:       "comma-separated url(s) for relay firehose(s); ws://, wss://, or moqt:// (MoQ-over-QUIC) relays may be mixed. Subscribing to several relays survives any one going down (duplicate events are deduped). Our own PDS firehose is always included so locally-published records are indexed immediately",
 				Value:       "wss://bsky.network",
 				Destination: &cli.RelayHost,
 				Sources:     urfavecli.EnvVars("SP_RELAY_HOST"),
@@ -606,13 +697,6 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 					return json.Unmarshal([]byte(s), &cli.DiscordWebhooks)
 				},
 				Sources: urfavecli.EnvVars("SP_DISCORD_WEBHOOKS"),
-			},
-			&urfavecli.BoolFlag{
-				Name:        "new-webrtc-playback",
-				Usage:       "enable new webrtc playback",
-				Value:       true,
-				Destination: &cli.NewWebRTCPlayback,
-				Sources:     urfavecli.EnvVars("SP_NEW_WEBRTC_PLAYBACK"),
 			},
 			&urfavecli.StringFlag{
 				Name:        "apple-team-id",
@@ -797,6 +881,69 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 				Destination: &cli.StreamSessionTimeout,
 				Sources:     urfavecli.EnvVars("SP_STREAM_SESSION_TIMEOUT"),
 			},
+			&urfavecli.IntFlag{
+				Name:        "vod-concurrency",
+				Usage:       "number of VOD processing tasks to run in parallel on this node",
+				Value:       2,
+				Destination: &cli.VODConcurrency,
+				Sources:     urfavecli.EnvVars("SP_VOD_CONCURRENCY"),
+			},
+			&urfavecli.IntFlag{
+				Name:        "sweep-concurrency",
+				Usage:       "how many PDS hosts the atproto backfill sweep talks to at once. Work is sharded by host and each host is walked by one worker, so this is a count of remote servers, not of repos; 0 for the default",
+				Value:       DefaultSweepConcurrency,
+				Destination: &cli.SweepConcurrency,
+				Sources:     urfavecli.EnvVars("SP_SWEEP_CONCURRENCY"),
+			},
+			&urfavecli.IntFlag{
+				Name:        "deepen-rate",
+				Usage:       "how many history windows per minute this node walks in the background. History deepening is decoupled from the sweep -- the sweep checks and repairs, this fetches the past -- and nothing on the node waits for it, so it is paced rather than run flat out; 0 removes the cap (an initial build in a hurry), negative for the default",
+				Value:       DefaultDeepenRate,
+				Destination: &cli.DeepenRate,
+				Sources:     urfavecli.EnvVars("SP_DEEPEN_RATE"),
+			},
+			&urfavecli.IntFlag{
+				Name:        "index-db-connections",
+				Usage:       "how many sqlite connections the index database pool holds. More than one lets reads run beside a reindex under WAL; 1 restores the old slower-but-safer single-connection arrangement; 0 for the default",
+				Value:       DefaultIndexDBConnections,
+				Destination: &cli.IndexDBConnections,
+				Sources:     urfavecli.EnvVars("SP_INDEX_DB_CONNECTIONS"),
+			},
+			&urfavecli.DurationFlag{
+				Name:        "sweep-boot-delay",
+				Usage:       "how long a node with a warm index waits after boot before its first sweep, so the sweep's reindexing does not compound the busiest minutes of a restart. A fresh (empty) index always sweeps immediately, as does a --no-firehose node (no replay heals its gap), and 0 sweeps immediately in every case",
+				Value:       DefaultSweepBootDelay,
+				Destination: &cli.SweepBootDelay,
+				Sources:     urfavecli.EnvVars("SP_SWEEP_BOOT_DELAY"),
+			},
+			&urfavecli.DurationFlag{
+				Name:        "sweep-interval",
+				Usage:       "how often to re-run the atproto sweep, which asks every indexed repo's host whether our copy is still current and repairs the ones that are not. 0 disables re-running; the sweep at startup always happens",
+				Value:       DefaultSweepInterval,
+				Destination: &cli.SweepInterval,
+				Sources:     urfavecli.EnvVars("SP_SWEEP_INTERVAL"),
+			},
+			&urfavecli.DurationFlag{
+				Name:        "firehose-replay-window",
+				Usage:       "how old a stored relay cursor may be and still be replayed from on connect. A cursor whose newest event is older than this is discarded and we tail the relay's live edge instead, leaving the gap for the sweep's head check to repair -- which is far cheaper than making the relay re-send every commit on the network. 0 always replays from the stored cursor",
+				Value:       DefaultFirehoseReplayWindow,
+				Destination: &cli.FirehoseReplayWindow,
+				Sources:     urfavecli.EnvVars("SP_FIREHOSE_REPLAY_WINDOW"),
+			},
+			&urfavecli.StringFlag{
+				Name:    "maximum-live-bitrate",
+				Usage:   "maximum allowed live ingest bitrate, measured per emitted segment. Accepts a bits-per-second number or a decimal SI suffix — e.g. 30M, 30000k, or 30000000 (all 30 Mbps). A stream whose bitrate exceeds this (plus a 10% margin) is disconnected and the streamer is shown a problem. 0 = unlimited",
+				Value:   "0",
+				Sources: urfavecli.EnvVars("SP_MAXIMUM_LIVE_BITRATE"),
+				Action: func(ctx context.Context, cmd *urfavecli.Command, s string) error {
+					v, err := ParseSI(s)
+					if err != nil {
+						return fmt.Errorf("invalid --maximum-live-bitrate: %w", err)
+					}
+					cli.MaximumLiveBitrate = int(v)
+					return nil
+				},
+			},
 			&urfavecli.BoolFlag{
 				Name:        "legacy-segment-cleaner",
 				Usage:       "re-enable the legacy segment cleaner. shouldn't be needed but can be useful in cases where localdb is too big.",
@@ -806,8 +953,8 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 			},
 			&urfavecli.DurationFlag{
 				Name:        "segment-archive-retention",
-				Usage:       "for users who don't specify a distribution policy, how long to keep segments around?",
-				Value:       24 * time.Hour,
+				Usage:       "how long to keep on-disk segment files before cleaning them up (durable copies live in S3/VOD). 0 disables cleanup.",
+				Value:       1 * time.Hour,
 				Destination: &cli.SegmentArchiveRetention,
 				Sources:     urfavecli.EnvVars("SP_SEGMENT_ARCHIVE_RETENTION"),
 			},
@@ -923,12 +1070,38 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 				Destination: &cli.S3Region,
 				Sources:     urfavecli.EnvVars("SP_S3_REGION"),
 			},
-			&urfavecli.BoolFlag{
-				Name:        "legacy-segmentation",
-				Usage:       "switch back from MUXL to legacy segmentation in case streams have problems (shouldn't need!)",
-				Value:       false,
-				Sources:     urfavecli.EnvVars("SP_LEGACY_SEGMENTATION"),
-				Destination: &cli.LegacySegmentation,
+			&urfavecli.StringFlag{
+				Name:        "vod-cdn-url",
+				Usage:       "Static CDN URL fronting the VOD blob store. When set, HLS playlists emit segment + init-segment URLs of the form <vod-cdn-url>/<cid>.mp4?did=...&sid=... instead of the self-hosted getVideoBlob endpoint. Omit for self-contained deployments.",
+				Destination: &cli.VODCDNURL,
+				Sources:     urfavecli.EnvVars("SP_VOD_CDN_URL"),
+			},
+			&urfavecli.StringFlag{
+				Name:        "beta-invite-did",
+				Usage:       "DID of the atproto account whose place.stream.beta.invite records this node trusts. When set, uploading VODs requires an invite from that account; when empty, falls back to the --allowed-streams allowlist used by livestreaming.",
+				Destination: &cli.BetaInviteDID,
+				Sources:     urfavecli.EnvVars("SP_BETA_INVITE_DID"),
+			},
+			&urfavecli.DurationFlag{
+				Name:        "view-log-flush-interval",
+				Usage:       "How often the view-log writer rotates its buffer to the VOD blob store. Set to 0 to disable view-event logging entirely (no view counts will be available downstream). Files land at view-logs/<server-did>/<window>.jsonl.gz alongside the VOD content blobs.",
+				Value:       5 * time.Minute,
+				Destination: &cli.ViewLogFlushInterval,
+				Sources:     urfavecli.EnvVars("SP_VIEW_LOG_FLUSH_INTERVAL"),
+			},
+			&urfavecli.DurationFlag{
+				Name:        "view-count-aggregate-interval",
+				Usage:       "How often a node tries to enqueue a view-count aggregation task. Buckets align on UTC multiples of this interval; deduplication via statedb's unique task-key constraint ensures only one node per bucket actually runs the aggregation. Set to 0 to disable aggregation (capture continues but no place.stream.media.viewCount records are published).",
+				Value:       5 * time.Minute,
+				Destination: &cli.ViewCountAggregateInterval,
+				Sources:     urfavecli.EnvVars("SP_VIEW_COUNT_AGGREGATE_INTERVAL"),
+			},
+			&urfavecli.DurationFlag{
+				Name:        "view-count-aggregate-lag",
+				Usage:       "How long the aggregator waits after a bucket closes before processing it, so all writers have time to flush their buffers. Should be at least one --view-log-flush-interval; default 2× that.",
+				Value:       10 * time.Minute,
+				Destination: &cli.ViewCountAggregateLag,
+				Sources:     urfavecli.EnvVars("SP_VIEW_COUNT_AGGREGATE_LAG"),
 			},
 			&urfavecli.BoolFlag{
 				Name:  "external-signing",
@@ -977,8 +1150,8 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 		})
 		cmd.Flags = append(cmd.Flags, &urfavecli.IntFlag{
 			Name:        "mist-http-port",
-			Usage:       "MistServer HTTP port (internal use only)",
-			Value:       18080,
+			Usage:       "MistServer HTTP port (internal use only) — ingest pulls Mist's live fMP4 output from this port, so it must match the running Mist config (docker/mistserver.json uses 28080, the default here)",
+			Value:       28080,
 			Destination: &cli.MistHTTPPort,
 			Sources:     urfavecli.EnvVars("SP_MIST_HTTP_PORT"),
 		})
@@ -1004,16 +1177,28 @@ func (cli *CLI) NewCommand(name string) *urfavecli.Command {
 
 var StreamplaceSchemePrefix = "streamplace://"
 
+// OwnPublicURL is the URL this process's own public listener answers on.
+//
+// With --secure we terminate TLS ourselves: the real handler is on HTTPSAddr
+// and the HTTPAddr listener only serves 307 redirects to it (ServeHTTPRedirect),
+// so http://<HTTPAddr> is not an address anything can actually be fetched from
+// — a websocket dial there gets the redirect instead of a 101 upgrade.
+// --behind-https-proxy is the opposite case: the proxy terminates TLS and we
+// really do serve the handler as plain HTTP on HTTPAddr, so only cli.Secure
+// flips this.
 func (cli *CLI) OwnPublicURL() string {
 	//  No errors because we know it's valid from AddrFlag
-	host, port, _ := net.SplitHostPort(cli.HTTPAddr)
+	addr, scheme := cli.HTTPAddr, "http"
+	if cli.Secure {
+		addr, scheme = cli.HTTPSAddr, "https"
+	}
+	host, port, _ := net.SplitHostPort(addr)
 
 	ip := net.ParseIP(host)
 	if host == "" || ip.IsUnspecified() {
 		host = "127.0.0.1"
 	}
-	addr := net.JoinHostPort(host, port)
-	return fmt.Sprintf("http://%s", addr)
+	return fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(host, port))
 }
 
 func (cli *CLI) OwnInternalURL() string {
@@ -1223,6 +1408,48 @@ func (cli *CLI) SegmentFileCreate(user string, aqt aqtime.AQTime, ext string) (*
 	return cli.DataFileCreate([]string{SegmentsDir, user, yr, mon, day, hr, min, fname}, false)
 }
 
+// ThumbnailFilePath returns the path to a user's current thumbnail. There is a
+// single, continually-overwritten thumbnail per user. The user is a DID
+// (e.g. did:plc:...); DataFilePath strips the colons so the filename is safe on
+// Windows.
+func (cli *CLI) ThumbnailFilePath(user string) string {
+	return cli.DataFilePath([]string{ThumbnailsDir, fmt.Sprintf("%s.jpg", user)})
+}
+
+// ThumbnailModTime returns the modification time of a user's thumbnail and
+// whether it exists. The mod time doubles as a "last seen live" signal.
+func (cli *CLI) ThumbnailModTime(user string) (time.Time, bool) {
+	fi, err := os.Stat(cli.ThumbnailFilePath(user))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return fi.ModTime(), true
+}
+
+// ThumbnailWrite atomically (re)writes a user's thumbnail. The image is written
+// to a temp file via the supplied function and renamed into place, so readers
+// (and PDS uploads) never observe a half-written thumbnail.
+func (cli *CLI) ThumbnailWrite(user string, write func(io.Writer) error) error {
+	final := cli.ThumbnailFilePath(user)
+	dir := filepath.Dir(final)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		return fmt.Errorf("error creating thumbnail dir %s: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, "thumb-*.jpg")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op once the rename below succeeds
+	if err := write(tmp); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), final)
+}
+
 // read a file from our data dir
 func (cli *CLI) DataFileRead(fpath []string, w io.Writer) error {
 	ddpath := cli.DataFilePath(fpath)
@@ -1330,6 +1557,55 @@ func (cli *CLI) DumpDebugSegment(ctx context.Context, name string, r io.Reader) 
 
 func (cli *CLI) S3Configured() bool {
 	return cli.S3Endpoint != "" && cli.S3Bucket != "" && cli.S3AccessKeyID != "" && cli.S3SecretAccessKey != ""
+}
+
+// S3Config assembles an s3.Config from the CLI's S3 flags.
+func (cli *CLI) S3Config() s3.Config {
+	return s3.Config{
+		Endpoint:        cli.S3Endpoint,
+		Bucket:          cli.S3Bucket,
+		AccessKeyID:     cli.S3AccessKeyID,
+		SecretAccessKey: cli.S3SecretAccessKey,
+		Region:          cli.S3Region,
+	}
+}
+
+// SetS3Config applies an s3.Config to the CLI's S3 fields — the inverse of
+// S3Config, for processes (ingest workers) that receive the S3 destination over
+// a handshake instead of from flags.
+func (cli *CLI) SetS3Config(c s3.Config) {
+	cli.S3Endpoint = c.Endpoint
+	cli.S3Bucket = c.Bucket
+	cli.S3AccessKeyID = c.AccessKeyID
+	cli.S3SecretAccessKey = c.SecretAccessKey
+	cli.S3Region = c.Region
+}
+
+// DebugRecordingFile is the write target returned by DebugRecordingCreate: an
+// *os.File on local disk, or an S3 upload that commits on Close. Name() reports
+// the destination (path or object key) for logging.
+type DebugRecordingFile interface {
+	io.WriteCloser
+	Name() string
+}
+
+// DebugRecordingCreate opens a write target for a debug recording (RTMP/MKV
+// dumps, WHIP rtcrec sessions). When S3 is configured the recording streams to
+// an S3 object at the key formed by joining fpath with "/" (so the bucket
+// mirrors the on-disk debug-recordings/<did>/<file> layout); otherwise it falls
+// back to a local file under DataDir — the dev default. The returned value must
+// be Closed to finalize (Close commits the S3 upload). overwrite only affects
+// the local-disk path (S3 puts always overwrite).
+func (cli *CLI) DebugRecordingCreate(ctx context.Context, fpath []string, contentType string, overwrite bool) (DebugRecordingFile, error) {
+	if cli.S3Configured() {
+		key := strings.Join(fpath, "/")
+		// The recording outlives the ingest session's ctx: Close commits the upload
+		// during teardown, after that ctx is typically cancelled — a cancelled ctx
+		// here would abort the upload and lose the object. Callers bound the commit
+		// with their own finalize waits instead.
+		return s3.NewUploadWriter(context.WithoutCancel(ctx), s3.NewClient(cli.S3Config()), cli.S3Bucket, key, contentType)
+	}
+	return cli.DataFileCreate(fpath, overwrite)
 }
 
 func (cli *CLI) ShouldSyndicate(did string) bool {

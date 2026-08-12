@@ -19,17 +19,18 @@ import (
 	"time"
 
 	"github.com/NYTimes/gziphandler"
-	"github.com/bluesky-social/indigo/api/bsky"
 	"github.com/google/uuid"
 	"github.com/julienschmidt/httprouter"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/cors"
 	sloghttp "github.com/samber/slog-http"
 	"golang.org/x/time/rate"
+	"stream.place/streamplace/pkg/appbsky"
 
 	"github.com/streamplace/oatproxy/pkg/oatproxy"
 	"stream.place/streamplace/js/app"
 	"stream.place/streamplace/pkg/atproto"
+	"stream.place/streamplace/pkg/blob"
 	"stream.place/streamplace/pkg/bus"
 	"stream.place/streamplace/pkg/config"
 	"stream.place/streamplace/pkg/crypto/signers/eip712"
@@ -42,9 +43,11 @@ import (
 	"stream.place/streamplace/pkg/mist/mistconfig"
 	"stream.place/streamplace/pkg/model"
 	"stream.place/streamplace/pkg/notifications"
+	"stream.place/streamplace/pkg/placestream"
 	"stream.place/streamplace/pkg/spxrpc"
 	"stream.place/streamplace/pkg/statedb"
-	"stream.place/streamplace/pkg/streamplace"
+	"stream.place/streamplace/pkg/upload"
+	"stream.place/streamplace/pkg/viewlog"
 
 	metrics "github.com/slok/go-http-metrics/metrics/prometheus"
 	"github.com/slok/go-http-metrics/middleware"
@@ -54,17 +57,20 @@ import (
 )
 
 type StreamplaceAPI struct {
-	CLI              *config.CLI
-	Model            model.Model
-	StatefulDB       *statedb.StatefulDB
-	LocalDB          localdb.LocalDB
-	Updater          *Updater
-	Signer           *eip712.EIP712Signer
-	Mimes            map[string]string
-	FirebaseNotifier notifications.FirebaseNotifier
-	MediaManager     *media.MediaManager
-	MediaSigner      media.MediaSigner
-	XRPCServer       *spxrpc.Server
+	CLI           *config.CLI
+	Model         model.Model
+	StatefulDB    *statedb.StatefulDB
+	LocalDB       localdb.LocalDB
+	Updater       *Updater
+	Signer        *eip712.EIP712Signer
+	Mimes         map[string]string
+	Notifier      notifications.Notifier
+	MediaManager  *media.MediaManager
+	MediaSigner   media.MediaSigner
+	UploadManager *upload.Manager
+	PlaybackStore blob.Store
+	ViewLog       *viewlog.Writer
+	XRPCServer    *spxrpc.Server
 	// not thread-safe yet
 	Aliases  map[string]string
 	Bus      *bus.Bus
@@ -81,12 +87,12 @@ type StreamplaceAPI struct {
 
 	// override tls port for http redirect server if we're using systemd file descriptors
 	HTTPRedirectTLSPort *int
-	sessions            map[string]map[string]time.Time
-	sessionsLock        sync.RWMutex
 
 	rtmpSessions             map[string]*media.RTMPSession
 	rtmpSessionsLock         sync.Mutex
 	rtmpInternalPlaybackAddr string
+
+	TVOSAuthStore *TVOSAuthStore
 }
 
 type WebsocketTracker struct {
@@ -95,7 +101,7 @@ type WebsocketTracker struct {
 	mu            sync.RWMutex
 }
 
-func MakeStreamplaceAPI(cli *config.CLI, mod model.Model, statefulDB *statedb.StatefulDB, noter notifications.FirebaseNotifier, mm *media.MediaManager, ms media.MediaSigner, bus *bus.Bus, atsync *atproto.ATProtoSynchronizer, d *director.Director, op *oatproxy.OATProxy, ldb localdb.LocalDB) (*StreamplaceAPI, error) {
+func MakeStreamplaceAPI(cli *config.CLI, mod model.Model, statefulDB *statedb.StatefulDB, noter notifications.Notifier, mm *media.MediaManager, ms media.MediaSigner, bus *bus.Bus, atsync *atproto.ATProtoSynchronizer, d *director.Director, op *oatproxy.OATProxy, ldb localdb.LocalDB, um *upload.Manager, playbackStore blob.Store, viewLog *viewlog.Writer) (*StreamplaceAPI, error) {
 	updater, err := PrepareUpdater(cli)
 	if err != nil {
 		return nil, err
@@ -104,9 +110,12 @@ func MakeStreamplaceAPI(cli *config.CLI, mod model.Model, statefulDB *statedb.St
 		Model:            mod,
 		StatefulDB:       statefulDB,
 		Updater:          updater,
-		FirebaseNotifier: noter,
+		Notifier:         noter,
 		MediaManager:     mm,
 		MediaSigner:      ms,
+		UploadManager:    um,
+		PlaybackStore:    playbackStore,
+		ViewLog:          viewLog,
 		Aliases:          map[string]string{},
 		Bus:              bus,
 		ATSync:           atsync,
@@ -115,8 +124,6 @@ func MakeStreamplaceAPI(cli *config.CLI, mod model.Model, statefulDB *statedb.St
 		limiters:         make(map[string]*rate.Limiter),
 		SignerCache:      make(map[string]media.MediaSigner),
 		op:               op,
-		sessions:         make(map[string]map[string]time.Time),
-		sessionsLock:     sync.RWMutex{},
 		rtmpSessions:     make(map[string]*media.RTMPSession),
 		rtmpSessionsLock: sync.Mutex{},
 		LocalDB:          ldb,
@@ -155,7 +162,7 @@ func (a *StreamplaceAPI) Handler(ctx context.Context) (http.Handler, error) {
 		Recorder: metrics.NewRecorder(metrics.Config{}),
 	})
 	var xrpc http.Handler
-	xrpc, err := spxrpc.NewServer(ctx, a.CLI, a.Model, a.StatefulDB, a.op, mdlw, a.ATSync, a.Bus, a.LocalDB, a.MediaManager, a.Aliases)
+	xrpc, err := spxrpc.NewServer(ctx, a.CLI, a.Model, a.StatefulDB, a.op, mdlw, a.ATSync, a.Bus, a.LocalDB, a.MediaManager, a.UploadManager, a.PlaybackStore, a.ViewLog, a.Aliases)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +190,8 @@ func (a *StreamplaceAPI) Handler(ctx context.Context) (http.Handler, error) {
 	router.Handler("GET", "/.well-known/assetlinks.json", a.HandleAndroidAssetLinks(ctx))
 	apiRouter := httprouter.New()
 	addFunc(apiRouter, "POST", "/api/notification", a.HandleNotification(ctx))
+	addFunc(apiRouter, "DELETE", "/api/notification", a.HandleNotificationDelete(ctx))
+	addFunc(apiRouter, "GET", "/api/notification/vapid-public-key", a.HandleVapidPublicKey(ctx))
 	// old clients
 	addFunc(router, "GET", "/app-updates", a.HandleAppUpdates(ctx))
 	// new ones
@@ -193,7 +202,6 @@ func (a *StreamplaceAPI) Handler(ctx context.Context) (http.Handler, error) {
 	addHandle(apiRouter, "DELETE", "/api/webrtc/:stream", a.MistProxyHandler(ctx, "/webrtc/%s"))
 	addFunc(apiRouter, "POST", "/api/segment", a.HandleSegment(ctx))
 	addFunc(apiRouter, "GET", "/api/healthz", a.HandleHealthz(ctx))
-	addHandle(apiRouter, "GET", "/api/playback/:user/hls/*file", a.HandleHLSPlayback(ctx))
 	// they're jpegs now
 	addHandle(apiRouter, "GET", "/api/playback/:user/stream.jpg", a.HandleThumbnailPlayback(ctx))
 	// this one is actually a jpeg (used previously and shouldn't remove for historical reasons)
@@ -209,14 +217,36 @@ func (a *StreamplaceAPI) Handler(ctx context.Context) (http.Handler, error) {
 	addHandle(apiRouter, "GET", "/api/bluesky/resolve/:handle", a.HandleBlueskyResolve(ctx))
 	addHandle(apiRouter, "GET", "/api/view-count/:user", a.HandleViewCount(ctx))
 	addHandle(apiRouter, "GET", "/api/clip/:user/:file", a.HandleClip(ctx))
+	if a.UploadManager != nil {
+		// Don't wrap in middlewarestd.Handler (go-http-metrics): its
+		// responseWriterInterceptor doesn't implement Unwrap, which would
+		// hide net/http.ResponseController.SetReadDeadline from tusd and
+		// produce one NetworkTimeoutError warning per PATCH chunk.
+		apiRouter.Handler("HEAD", "/api/upload/:id", a.UploadManager)
+		apiRouter.Handler("PATCH", "/api/upload/:id", a.UploadManager)
+		apiRouter.Handler("DELETE", "/api/upload/:id", a.UploadManager)
+		apiRouter.Handler("OPTIONS", "/api/upload/:id", a.UploadManager)
+	}
+
+	// Apple TV device-pairing OAuth. See pkg/api/tvos_auth.go.
+	if a.TVOSAuthStore == nil {
+		a.TVOSAuthStore = NewTVOSAuthStore(ctx)
+	}
+	addHandle(apiRouter, "POST", "/api/tvos-auth/start", a.HandleTVOSAuthStart(ctx))
+	addHandle(apiRouter, "GET", "/api/tvos-auth/:sessionId", a.HandleTVOSAuthPoll(ctx))
+	addHandle(apiRouter, "POST", "/api/tvos-auth/:sessionId/complete-browser", a.HandleTVOSAuthCompleteBrowser(ctx))
+	addHandle(apiRouter, "POST", "/api/tvos-auth/:sessionId/complete-mobile", a.HandleTVOSAuthCompleteMobile(ctx))
+
 	apiRouter.NotFound = a.HandleAPI404(ctx)
 	apiRouterHandler := a.RateLimitMiddleware(ctx)(apiRouter)
 	xrpcHandler := a.RateLimitMiddleware(ctx)(xrpc)
 	router.Handler("GET", "/api/*resource", apiRouterHandler)
+	router.Handler("HEAD", "/api/*resource", apiRouterHandler)
 	router.Handler("POST", "/api/*resource", apiRouterHandler)
 	router.Handler("PUT", "/api/*resource", apiRouterHandler)
 	router.Handler("PATCH", "/api/*resource", apiRouterHandler)
 	router.Handler("DELETE", "/api/*resource", apiRouterHandler)
+	router.Handler("OPTIONS", "/api/*resource", apiRouterHandler)
 	router.Handler("GET", "/xrpc/*resource", xrpcHandler)
 	router.Handler("POST", "/xrpc/*resource", xrpcHandler)
 	router.Handler("PUT", "/xrpc/*resource", xrpcHandler)
@@ -278,7 +308,20 @@ func (a *StreamplaceAPI) Handler(ctx context.Context) (http.Handler, error) {
 	})
 	handler := sloghttp.Recovery(router)
 	handler = cors.AllowAll().Handler(handler)
-	handler = sloghttp.New(slog.Default())(handler)
+	// sloghttp.New wraps the ResponseWriter with a bodyWriter that doesn't
+	// implement Unwrap, which hides net/http.ResponseController.SetReadDeadline
+	// from tusd and floods the logs with one NetworkTimeoutError warning per
+	// PATCH chunk. Skip it for /api/upload/* so the response writer stays
+	// unwrapped on the upload path; tusd has its own per-request logging.
+	preLog := handler
+	logged := sloghttp.New(slog.Default())(handler)
+	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, upload.BasePath) {
+			preLog.ServeHTTP(w, r)
+			return
+		}
+		logged.ServeHTTP(w, r)
+	})
 	handler = a.RateLimitMiddleware(ctx)(handler)
 	redirectMiddleware, err := a.RedirectMiddleware()
 	if err != nil {
@@ -358,6 +401,18 @@ func (a *StreamplaceAPI) NotFoundLinkingHandler(ctx context.Context, linker *lin
 		}
 		req.URL.Host = req.Host
 		req.URL.Scheme = proto
+
+		// VOD link cards live at /<user>/video/<tid>. Everything else with a
+		// slash in it falls through to static-file / default-card handling.
+		parts := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
+		if len(parts) == 3 && parts[1] == "video" {
+			if a.writeVideoCard(ctx, w, req, linker, parts[0], parts[2]) {
+				return
+			}
+			defaultHandler.ServeHTTP(w, req)
+			return
+		}
+
 		maybeHandle := strings.TrimPrefix(req.URL.Path, "/")
 		// quick check for things that aren't valid handles/dids
 		if strings.ContainsAny(maybeHandle, "/_") {
@@ -393,6 +448,37 @@ func (a *StreamplaceAPI) NotFoundLinkingHandler(ctx context.Context, linker *lin
 			log.Error(ctx, "error writing response", "error", err)
 		}
 	}), nil
+}
+
+// writeVideoCard renders an OpenGraph link card for a VOD at
+// /<user>/video/<tid>, pulling the video out of the local index. It returns
+// true when it wrote a response, and false (having written nothing) when the
+// video can't be found or rendered, so the caller can fall back to
+// static-file / default-card handling.
+func (a *StreamplaceAPI) writeVideoCard(ctx context.Context, w http.ResponseWriter, req *http.Request, linker *linking.Linker, user, tid string) bool {
+	repo, err := a.Model.GetRepoByHandleOrDID(user)
+	if err != nil || repo == nil {
+		return false
+	}
+	uri := fmt.Sprintf("at://%s/place.stream.video/%s", repo.DID, tid)
+	vv, err := a.Model.GetVideoView(ctx, uri)
+	if err != nil {
+		log.Error(ctx, "error fetching video view for card", "uri", uri, "error", err)
+		return false
+	}
+	if vv == nil {
+		return false
+	}
+	bs, err := linker.GenerateVideoCard(ctx, req.URL, vv, a.CLI.SentryDSN)
+	if err != nil {
+		log.Error(ctx, "error generating video card", "uri", uri, "error", err)
+		return false
+	}
+	w.Header().Set("Content-Type", "text/html")
+	if _, err := w.Write(bs); err != nil {
+		log.Error(ctx, "error writing response", "error", err)
+	}
+	return true
 }
 
 func (a *StreamplaceAPI) MistProxyHandler(ctx context.Context, tmpl string) httprouter.Handle {
@@ -484,6 +570,7 @@ func (a *StreamplaceAPI) RedirectHandler(ctx context.Context) (http.Handler, err
 type NotificationPayload struct {
 	Token   string `json:"token"`
 	RepoDID string `json:"repoDID"`
+	Type    string `json:"type"`
 }
 
 func (a *StreamplaceAPI) HandleAPI404(ctx context.Context) http.HandlerFunc {
@@ -507,7 +594,7 @@ func (a *StreamplaceAPI) HandleNotification(ctx context.Context) http.HandlerFun
 			w.WriteHeader(400)
 			return
 		}
-		err = a.StatefulDB.CreateNotification(n.Token, n.RepoDID)
+		err = a.StatefulDB.CreateNotification(n.Token, n.RepoDID, statedb.NotificationType(n.Type))
 		if err != nil {
 			log.Log(ctx, "error creating notification", "error", err)
 			w.WriteHeader(400)
@@ -522,6 +609,59 @@ func (a *StreamplaceAPI) HandleNotification(ctx context.Context) http.HandlerFun
 					log.Error(ctx, "error syncing bluesky repo after notification creation", "error", err)
 				}
 			}()
+		}
+	}
+}
+
+// HandleNotificationDelete removes a push token (web or mobile). Used by the
+// web client when a user disables notifications — the browser subscription is
+// unsubscribed locally and the server row is pruned so we stop pushing to a
+// dead endpoint.
+func (a *StreamplaceAPI) HandleNotificationDelete(ctx context.Context) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		payload, err := io.ReadAll(req.Body)
+		if err != nil {
+			log.Log(ctx, "error reading notification delete", "error", err)
+			w.WriteHeader(400)
+			return
+		}
+		n := NotificationPayload{}
+		if err := json.Unmarshal(payload, &n); err != nil {
+			log.Log(ctx, "error unmarshalling notification delete", "error", err)
+			w.WriteHeader(400)
+			return
+		}
+		if n.Token == "" {
+			w.WriteHeader(400)
+			return
+		}
+		if err := a.StatefulDB.DeleteNotification(n.Token); err != nil {
+			log.Log(ctx, "error deleting notification", "error", err)
+			w.WriteHeader(400)
+			return
+		}
+		log.Log(ctx, "successfully deleted notification", "token", n.Token)
+		w.WriteHeader(200)
+	}
+}
+
+// HandleVapidPublicKey returns the server's Web Push VAPID public key. The web
+// client needs it to subscribe the browser's PushManager. The key is generated
+// on first access (via EnsureVAPIDKeys) and stays stable thereafter.
+func (a *StreamplaceAPI) HandleVapidPublicKey(ctx context.Context) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		keys, err := a.StatefulDB.EnsureVAPIDKeys(ctx)
+		if err != nil {
+			log.Error(ctx, "error ensuring vapid keys", "error", err)
+			apierrors.WriteHTTPInternalServerError(w, "unable to get vapid public key", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		resp := struct {
+			PublicKey string `json:"publicKey"`
+		}{PublicKey: keys.PublicKey}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Error(ctx, "error writing vapid public key", "error", err)
 		}
 	}
 }
@@ -570,7 +710,7 @@ func (a *StreamplaceAPI) HandleViewCount(ctx context.Context) httprouter.Handle 
 			return
 		}
 		count := a.Bus.GetViewerCount(user)
-		bs, err := json.Marshal(streamplace.Livestream_ViewerCount{Count: int64(count), LexiconTypeID: "place.stream.livestream#viewerCount"})
+		bs, err := json.Marshal(placestream.Livestream_ViewerCount{Count: int64(count), LexiconTypeID: "place.stream.livestream#viewerCount"})
 		if err != nil {
 			apierrors.WriteHTTPInternalServerError(w, "could not marshal view count", err)
 			return
@@ -606,9 +746,9 @@ func (a *StreamplaceAPI) HandleBlueskyResolve(ctx context.Context) httprouter.Ha
 }
 
 type ChatResponse struct {
-	Post *bsky.FeedPost `json:"post"`
-	Repo *model.Repo    `json:"repo"`
-	CID  string         `json:"cid"`
+	Post *appbsky.FeedPost `json:"post"`
+	Repo *model.Repo       `json:"repo"`
+	CID  string            `json:"cid"`
 }
 
 func (a *StreamplaceAPI) HandleChat(ctx context.Context) httprouter.Handle {
@@ -844,7 +984,21 @@ func (a *StreamplaceAPI) ServeHTTPS(ctx context.Context) error {
 
 func (a *StreamplaceAPI) ServerWithShutdown(ctx context.Context, handler http.Handler, serve func(*http.Server) error) error {
 	ctx, cancel := context.WithCancel(ctx)
-	handler = gziphandler.GzipHandler(handler)
+	// gziphandler wraps the ResponseWriter without an Unwrap method, which
+	// hides net/http.ResponseController.SetReadDeadline from tusd and produces
+	// one NetworkTimeoutError warning per PATCH chunk (plus, more importantly,
+	// prevents tusd from extending the read deadline mid-upload so chunks
+	// taking longer than the default NetworkTimeout will fail). Skip gzip for
+	// /api/upload/*; compressing opaque upload bytes is pointless anyway.
+	raw := handler
+	gzipped := gziphandler.GzipHandler(handler)
+	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, upload.BasePath) {
+			raw.ServeHTTP(w, r)
+			return
+		}
+		gzipped.ServeHTTP(w, r)
+	})
 	server := http.Server{Handler: handler}
 	var serveErr error
 	go func() {

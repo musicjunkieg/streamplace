@@ -28,10 +28,16 @@ jobs:
           password: ${{ github.token }}
 
       - name: run build for linting
+        # Forks can read the public build cache but can't push to the
+        # upstream ghcr registry, so only pass --cache-to on the main repo.
+        env:
+          CACHE_TO:
+            ${{ github.repository == 'streamplace/streamplace' && '--cache-to
+            ghcr.io/streamplace/streamplace' || '' }}
         run: |
           sudo apt install podman -y
           sudo ln -s $(realpath ./hack/golangci-lint) /usr/bin/golangci-lint
-          make golangci-lint-container BUILDER_TARGET=builder-no-darwin DOCKER_BUILD_OPTS="--layers --cache-to ghcr.io/streamplace/streamplace --cache-from ghcr.io/streamplace/streamplace"
+          make golangci-lint-container BUILDER_TARGET=builder-no-darwin DOCKER_BUILD_OPTS="--layers $CACHE_TO --cache-from ghcr.io/streamplace/streamplace"
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8

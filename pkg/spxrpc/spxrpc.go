@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -16,6 +17,7 @@ import (
 	"github.com/streamplace/oatproxy/pkg/oatproxy"
 	"stream.place/streamplace/pkg/aqhttp"
 	"stream.place/streamplace/pkg/atproto"
+	"stream.place/streamplace/pkg/blob"
 	"stream.place/streamplace/pkg/bus"
 	"stream.place/streamplace/pkg/config"
 	"stream.place/streamplace/pkg/localdb"
@@ -23,6 +25,8 @@ import (
 	"stream.place/streamplace/pkg/media"
 	"stream.place/streamplace/pkg/model"
 	"stream.place/streamplace/pkg/statedb"
+	"stream.place/streamplace/pkg/upload"
+	"stream.place/streamplace/pkg/viewlog"
 )
 
 type Server struct {
@@ -32,30 +36,44 @@ type Server struct {
 	OGImageCache    *cache.Cache
 	LiveUsersCache  *cache.Cache
 	GameSearchCache *cache.Cache
+	ScoreCache      *cache.Cache
 	ATSync          *atproto.ATProtoSynchronizer
 	statefulDB      *statedb.StatefulDB
 	bus             *bus.Bus
 	op              *oatproxy.OATProxy
 	localDB         localdb.LocalDB
 	mm              *media.MediaManager
-	aliases         map[string]string
+	uploadManager   *upload.Manager
+	// playbackStore is where VOD blobs + metafiles + per-track init
+	// segments live. Matches the blob.Store the VOD processor writes
+	// into (vod.BlobsPrefix + <cid>.{mp4,json}).
+	playbackStore blob.Store
+	// viewLog records playback request events (manifest + segment
+	// fetches) for later view-count aggregation. Optional; nil when
+	// --view-log-flush-interval is 0 or no playback store is wired.
+	viewLog *viewlog.Writer
+	aliases map[string]string
 }
 
-func NewServer(ctx context.Context, cli *config.CLI, model model.Model, statefulDB *statedb.StatefulDB, op *oatproxy.OATProxy, mdlw middleware.Middleware, atsync *atproto.ATProtoSynchronizer, bus *bus.Bus, ldb localdb.LocalDB, mm *media.MediaManager, aliases map[string]string) (*Server, error) {
+func NewServer(ctx context.Context, cli *config.CLI, model model.Model, statefulDB *statedb.StatefulDB, op *oatproxy.OATProxy, mdlw middleware.Middleware, atsync *atproto.ATProtoSynchronizer, bus *bus.Bus, ldb localdb.LocalDB, mm *media.MediaManager, um *upload.Manager, playbackStore blob.Store, viewLog *viewlog.Writer, aliases map[string]string) (*Server, error) {
 	e := echo.New()
 	s := &Server{
 		e:               e,
 		cli:             cli,
 		model:           model,
 		OGImageCache:    cache.New(5*time.Minute, 10*time.Minute),
-		LiveUsersCache:  cache.New(5*time.Second, 10*time.Second),
+		LiveUsersCache:  cache.New(30*time.Second, 60*time.Second),
 		GameSearchCache: cache.New(60*time.Second, 2*time.Minute),
+		ScoreCache:      cache.New(30*time.Second, 60*time.Second),
 		ATSync:          atsync,
 		statefulDB:      statefulDB,
 		bus:             bus,
 		op:              op,
 		localDB:         ldb,
 		mm:              mm,
+		uploadManager:   um,
+		playbackStore:   playbackStore,
+		viewLog:         viewLog,
 		aliases:         aliases,
 	}
 	e.Use(s.ErrorHandlingMiddleware())
@@ -63,23 +81,43 @@ func NewServer(ctx context.Context, cli *config.CLI, model model.Model, stateful
 	e.Use(echomiddleware.Handler("", mdlw))
 	e.Use(s.ServiceAuthMiddleware())
 	e.Use(op.OAuthMiddleware)
-	err := s.RegisterHandlersPlaceStream(e)
+	err := s.RegisterHandlersPlacestream(e)
 	if err != nil {
 		return nil, err
 	}
-	err = s.RegisterHandlersAppBsky(e)
+	err = s.RegisterHandlersAppbsky(e)
 	if err != nil {
 		return nil, err
 	}
-	err = s.RegisterHandlersComAtproto(e)
+	err = s.RegisterHandlersGamesgamesgamesgamesgames(e)
+	if err != nil {
+		return nil, err
+	}
+	err = s.RegisterHandlersComatproto(e)
 	if err != nil {
 		return nil, err
 	}
 	e.GET("/xrpc/_health", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, map[string]string{"version": cli.Build.Version})
+		return c.JSON(http.StatusOK, map[string]string{"version": fmt.Sprintf("streamplace %s", cli.Build.Version)})
 	})
 	e.GET("/xrpc/com.atproto.sync.subscribeRepos", s.handleComAtprotoSyncSubscribeRepos)
 	e.GET("/xrpc/place.stream.live.subscribeSegments", s.handlePlaceStreamLiveSubscribeSegments)
+	// Override the auto-generated playback stubs: the wrapper in
+	// stubs.go hard-codes status 200 + content-type, but we need
+	// 206 Partial Content for HTTP Range on getVideoBlob and the
+	// `application/vnd.apple.mpegurl` MIME for getVideoPlaylist.
+	// Registering AFTER RegisterHandlersPlacestream wins because
+	// echo's last-write-wins for exact-match routes.
+	e.GET("/xrpc/place.stream.playback.getVideoBlob", s.HandleGetVideoBlob)
+	e.GET("/xrpc/place.stream.playback.getVideoPlaylist", s.HandleGetVideoPlaylist)
+	// Live HLS, same override rationale (Range + mpegurl), served from the
+	// in-memory live window instead of a stored metafile.
+	e.GET("/xrpc/place.stream.playback.getLivePlaylist", s.HandleGetLivePlaylist)
+	e.GET("/xrpc/place.stream.playback.getLiveSegment", s.HandleGetLiveSegment)
+	// glex code-generated these but we want them just passed upstream
+	e.POST("/xrpc/com.atproto.repo.createRecord", s.HandleWildcard)
+	e.POST("/xrpc/com.atproto.repo.putRecord", s.HandleWildcard)
+	e.POST("/xrpc/com.atproto.repo.deleteRecord", s.HandleWildcard)
 	e.GET("/xrpc/*", s.HandleWildcard)
 	e.POST("/xrpc/*", s.HandleWildcard)
 	return s, nil
@@ -158,12 +196,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.e.ServeHTTP(w, r)
 }
 
+const AccountDeactivated = "AccountDeactivated"
+
 func (s *Server) ErrorHandlingMiddleware() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			err := next(c)
 			if err == nil {
 				return nil
+			}
+			// this can mean we missed a PDS migration and need to refresh identity
+			if strings.Contains(err.Error(), AccountDeactivated) {
+				session, _ := oatproxy.GetOAuthSession(c.Request().Context())
+				if session != nil {
+					_, err := s.ATSync.RefreshIdentity(c.Request().Context(), session.DID)
+					if err != nil {
+						return err
+					}
+				}
 			}
 			httpError, ok := err.(*echo.HTTPError)
 			if ok {

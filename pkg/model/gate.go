@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"stream.place/streamplace/pkg/streamplace"
+	"stream.place/streamplace/pkg/placestream"
 )
 
 type Gate struct {
@@ -18,15 +18,15 @@ type Gate struct {
 	CreatedAt     time.Time `gorm:"column:created_at"`
 }
 
-func (g *Gate) ToStreamplaceGate() (*streamplace.ChatGate, error) {
-	return &streamplace.ChatGate{
+func (g *Gate) ToStreamplaceGate() (placestream.ChatGate, error) {
+	return placestream.ChatGate{
 		LexiconTypeID: "place.stream.chat.gate",
 		HiddenMessage: g.HiddenMessage,
 	}, nil
 }
 
 func (m *DBModel) CreateGate(ctx context.Context, gate *Gate) error {
-	return m.DB.Create(gate).Error
+	return createOrVerify(ctx, m, gate, map[string]any{"rkey": gate.RKey})
 }
 
 func (m *DBModel) GetGate(ctx context.Context, rkey string) (*Gate, error) {

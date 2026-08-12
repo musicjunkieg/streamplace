@@ -30,7 +30,7 @@ type StatefulDB struct {
 	CLI   *config.CLI
 	Type  DBType
 	locks *NamedLocks
-	noter notificationpkg.FirebaseNotifier
+	noter notificationpkg.Notifier
 	model model.Model
 	// pokeQueue is used to wake up the queue processor when a new task is enqueued
 	pokeQueue chan struct{}
@@ -38,6 +38,19 @@ type StatefulDB struct {
 	pgLockConn   *gorm.DB
 	pgLockConnMu sync.Mutex
 	OATProxy     *oatproxy.OATProxy
+	// vodProcessor runs the gstreamer + muxl + S3 pipeline for a VOD
+	// upload task. Installed via SetVODProcessor at bootstrap so
+	// pkg/statedb doesn't have to depend on the gstreamer-heavy pkg/vod.
+	vodProcessor VODProcessor
+	// viewCountAggregator collapses a window of view-log files into
+	// place.stream.media.viewCount records. Installed via
+	// SetViewCountAggregator at bootstrap so pkg/statedb doesn't have
+	// to depend on the blob.Store-heavy pkg/viewlog.
+	viewCountAggregator ViewCountAggregator
+	// livestreamVODFinalizer concatenates a finished livestream's recorded
+	// MUXL objects into a VOD. Installed via SetLivestreamVODFinalizer at
+	// bootstrap, same indirection as vodProcessor.
+	livestreamVODFinalizer LivestreamVODFinalizer
 }
 
 // list tables here so we can migrate them
@@ -55,12 +68,15 @@ var StatefulDBModels = []any{
 	ModerationAuditLog{},
 	Storage{},
 	BroadcastOrigin{},
+	S3Segment{},
+	Upload{},
+	DraftVideo{},
 }
 
 var NoPostgresDatabaseCode = "3D000"
 
 // Stateful database for storing private streamplace state
-func MakeDB(ctx context.Context, cli *config.CLI, noter notificationpkg.FirebaseNotifier, model model.Model) (*StatefulDB, error) {
+func MakeDB(ctx context.Context, cli *config.CLI, noter notificationpkg.Notifier, model model.Model) (*StatefulDB, error) {
 	dbURL := cli.DBURL
 	log.Log(ctx, "starting stateful database", "dbURL", redactDBURL(dbURL))
 	var dial gorm.Dialector
@@ -91,9 +107,8 @@ func MakeDB(ctx context.Context, cli *config.CLI, noter notificationpkg.Firebase
 		}
 	}
 	if dbType == DBTypeSQLite {
-		err = db.Exec("PRAGMA journal_mode=WAL;").Error
-		if err != nil {
-			return nil, fmt.Errorf("error setting journal mode: %w", err)
+		if err := sqlitePragmas(db); err != nil {
+			return nil, err
 		}
 		sqlDB, err := db.DB()
 		if err != nil {
@@ -133,6 +148,18 @@ func MakeDB(ctx context.Context, cli *config.CLI, noter notificationpkg.Firebase
 		}
 	}
 	return state, nil
+}
+
+// sqlitePragmas applies the two settings a sqlite state database needs: WAL, so
+// readers do not block the writer, and a busy timeout, so a writer in another
+// process (`streamplace sync`, warming a new index) is waited for instead of
+// erroring out. It is a function rather than two lines in MakeDB because
+// MakeDB's `model` parameter shadows the package the timeout lives in.
+func sqlitePragmas(db *gorm.DB) error {
+	if err := db.Exec("PRAGMA journal_mode=WAL;").Error; err != nil {
+		return fmt.Errorf("error setting journal mode: %w", err)
+	}
+	return model.SetSQLiteBusyTimeout(db)
 }
 
 func openDB(dial gorm.Dialector) (*gorm.DB, error) {

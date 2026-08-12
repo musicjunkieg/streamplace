@@ -9,13 +9,16 @@ export type SettingsStackParamList = {
   WebhooksSettings: undefined;
   BackupSettings: undefined;
   PrivacyCategory: undefined;
+  NotificationsCategory: undefined;
   DanmuCategory: undefined;
   AdvancedCategory: undefined;
   LanguagesCategory: undefined;
-  DeveloperSettings: undefined;
+  MultistreamCategory: undefined;
+  RecommendationsSettings: undefined;
   KeyManagement: undefined;
   BadgeSelection: undefined;
   BadgeIssuer: undefined;
+  BrandingAdmin: undefined;
 };
 
 export type HomeStackParamList = {
@@ -26,11 +29,23 @@ export type HomeStackParamList = {
   Login: undefined;
   Multi: { config: string };
   Support: undefined;
+  Upload: undefined;
+  UploadVideo: { tid: string };
+  UploadDrafts: undefined;
+  UploadLivestreams: undefined;
+  UploadVideos: undefined;
+};
+
+// Videos tab navigator
+export type VideosStackParamList = {
+  VideoList: undefined;
+  UserVideoList: { did: string };
 };
 
 // Main tab navigator
 export type TabParamList = {
   HomeTab: NavigatorScreenParams<HomeStackParamList>;
+  VideosTab: NavigatorScreenParams<VideosStackParamList>;
   GoLiveTab: undefined;
   SettingsTab: NavigatorScreenParams<SettingsStackParamList>;
 };
@@ -47,12 +62,25 @@ export type RootStackParamList = {
   Embed: { user: string };
   InfoWidgetEmbed: undefined;
   DanmuOBS: { user: string };
-  AVSync: undefined;
-  LegacyStream: { user: string };
   PopoutStreamMonitor: undefined;
   PopoutInfoWidget: undefined;
   PopoutMultistream: undefined;
   PopoutLivestream: undefined;
+  Video: undefined;
+  Vod: { user: string; tid: string };
+  VodEmbed: { user: string; tid: string };
+
+  // TV companion screens (phone/web only)
+  PairTV: { code?: string } | undefined;
+  TVChatInput: { streamer: string };
+  TVOSAuth: { code?: string } | undefined;
+
+  // tvOS-only screens (rendered by shell.tv.tsx's navigator; listed here
+  // so useNavigation()/useRoute() get types through the global
+  // RootParamList augmentation below)
+  TVHome: undefined;
+  TVStream: { user: string };
+  TVLogin: undefined;
 };
 
 // Helper type for screen props

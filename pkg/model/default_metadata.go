@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	lexutil "github.com/bluesky-social/indigo/lex/util"
+	glex "github.com/streamplace/glex/runtime"
 	"gorm.io/gorm"
-	"stream.place/streamplace/pkg/streamplace"
+	"stream.place/streamplace/pkg/placestream"
 )
 
 type MetadataConfiguration struct {
@@ -16,18 +16,16 @@ type MetadataConfiguration struct {
 	Record  *[]byte
 }
 
-func (m *MetadataConfiguration) ToStreamplaceMetadataConfiguration() (*streamplace.MetadataConfiguration, error) {
-	rec, err := lexutil.CborDecodeValue(*m.Record)
-	if err != nil {
-		return nil, fmt.Errorf("error decoding feed post: %w", err)
-	}
-	sdm, ok := rec.(*streamplace.MetadataConfiguration)
-	if !ok {
-		return nil, fmt.Errorf("invalid metadata configuration")
+func (m *MetadataConfiguration) ToStreamplaceMetadataConfiguration() (placestream.MetadataConfiguration, error) {
+	var sdm placestream.MetadataConfiguration
+	if err := glex.DecodeCBOR(*m.Record, &sdm); err != nil {
+		return placestream.MetadataConfiguration{}, fmt.Errorf("error decoding metadata configuration: %w", err)
 	}
 	return sdm, nil
 }
 
+// CreateMetadataConfiguration stores a repo's metadata configuration. One row
+// per repo, no CID column: Save is already redelivery-safe. See CreateChatProfile.
 func (m *DBModel) CreateMetadataConfiguration(ctx context.Context, metadata *MetadataConfiguration) error {
 	err := m.DB.Save(metadata).Error
 	if err != nil {

@@ -3,29 +3,35 @@ package atproto
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/carstore"
-	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
 	atrepo "github.com/bluesky-social/indigo/repo"
 	"github.com/bluesky-social/indigo/util"
 	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/ipld/go-car"
+	glex "github.com/streamplace/glex/runtime"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"stream.place/streamplace/pkg/comatproto"
 
 	"stream.place/streamplace/pkg/config"
+	"stream.place/streamplace/pkg/crypto/spkey"
 	"stream.place/streamplace/pkg/log"
 	"stream.place/streamplace/pkg/statedb"
+
+	gocrypto "crypto"
 )
 
 var ServerRepo *atrepo.Repo
@@ -36,6 +42,22 @@ var ServerRepoUser models.Uid = models.Uid(1)
 var serverRepoLock sync.Mutex
 var serverCommitDB *gorm.DB
 var serverRepoSigner func(ctx context.Context, did string, sb []byte) ([]byte, error)
+
+// serverRepoPriv is the node's secp256k1 server-repo private key — the key
+// behind its did:web identity — captured by MakeServerRepo. Nil until then.
+var serverRepoPriv *atcrypto.PrivateKeyK256
+
+// ServerCryptoSigner returns a crypto.Signer for the node's own secp256k1
+// identity (the server-repo key behind its did:web). Used to S2PA-sign
+// node-produced artifacts — e.g. a transcoded audio track minted at validate
+// time, signed as a c2pa.transcoded derivative of the streamer's segment.
+// Errors if the server repo hasn't been initialized yet.
+func ServerCryptoSigner() (gocrypto.Signer, error) {
+	if serverRepoPriv == nil {
+		return nil, fmt.Errorf("server repo key not initialized")
+	}
+	return spkey.KeyToSigner(serverRepoPriv)
+}
 
 // serverCommitSubscribers is notified when new commit events are created.
 var serverCommitSubscribers []chan *ServerCommitEvent
@@ -132,6 +154,8 @@ func MakeServerRepo(ctx context.Context, cli *config.CLI, state *statedb.Statefu
 			return nil, fmt.Errorf("failed to save server repo key: %w", err)
 		}
 	}
+
+	serverRepoPriv = priv
 
 	pub, err := priv.PublicKey()
 	if err != nil {
@@ -301,7 +325,7 @@ func CommitServerRepoRecord(ctx context.Context, cli *config.CLI, collection str
 	rpath := fmt.Sprintf("%s/%s", collection, rkey)
 	var recordCid cid.Cid
 	var action string
-	_, _, err = r.GetRecord(ctx, rpath)
+	_, _, err = r.GetRecordBytes(ctx, rpath)
 	if err != nil {
 		// Record doesn't exist, create it
 		recordCid, err = r.PutRecord(ctx, rpath, value)
@@ -330,19 +354,19 @@ func CommitServerRepoRecord(ctx context.Context, cli *config.CLI, collection str
 
 	ServerRepo = r
 
-	cidLink := lexutil.LexLink(recordCid)
+	cidLink := glex.Link(recordCid)
 	signed := r.SignedCommit()
 	commit := &comatproto.SyncSubscribeRepos_Commit{
 		Repo:   cli.ServerDID(),
 		Blocks: blocks,
 		Rev:    rev,
-		Commit: lexutil.LexLink(root),
+		Commit: glex.Link(root),
 		Time:   time.Now().Format(util.ISO8601),
-		Ops: []*comatproto.SyncSubscribeRepos_RepoOp{
+		Ops: []comatproto.SyncSubscribeRepos_RepoOp{
 			{
 				Action: action,
 				Path:   rpath,
-				Cid:    &cidLink,
+				Cid:    cidLink,
 			},
 		},
 		TooBig: false,
@@ -406,6 +430,71 @@ func ServerRepoMerkleProof(ctx context.Context, collection string, rkey string) 
 	return buf.Bytes(), nil
 }
 
+// ServerRepoListCollections walks the server repo's MST and returns
+// the distinct collection NSIDs currently holding at least one record.
+// Used by com.atproto.repo.describeRepo to advertise what's actually
+// in the repo rather than a hardcoded list. Returned collections are
+// sorted lexicographically for stable output.
+func ServerRepoListCollections(ctx context.Context) ([]string, error) {
+	serverRepoLock.Lock()
+	defer serverRepoLock.Unlock()
+
+	r, _, err := OpenServerRepo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ServerRepoListCollections: failed to open repo: %w", err)
+	}
+	seen := map[string]struct{}{}
+	err = r.ForEach(ctx, "", func(rpath string, _ cid.Cid) error {
+		// rpath is "<collection>/<rkey>"; pull the prefix.
+		slash := strings.IndexByte(rpath, '/')
+		if slash <= 0 {
+			return nil
+		}
+		seen[rpath[:slash]] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ServerRepoListCollections: error iterating records: %w", err)
+	}
+	out := make([]string, 0, len(seen))
+	for c := range seen {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// defaultListRecordsLimit / maxListRecordsLimit mirror the standard
+// com.atproto.repo.listRecords lexicon defaults so callers get
+// predictable pagination regardless of whether they hit a Streamplace
+// node or a stock PDS.
+const (
+	defaultListRecordsLimit = 50
+	maxListRecordsLimit     = 100
+)
+
+// ServerRepoListRecords returns records in a single collection of the
+// server's atproto repo, honoring the standard listRecords contract:
+//
+//   - filters strictly to the requested `collection`
+//   - paginates via `cursor` (opaque to the client; we use the last
+//     rkey of the prior page) and `limit` (clamped to [1, 100],
+//     defaulting to 50)
+//   - **natural order is reverse-lexical (descending rkey)**, so for
+//     TID-shaped rkeys callers get newest-first by default. The
+//     `reverse` param flips back to ascending for callers that want
+//     chronological order.
+//
+// `repo` is used only to build the `at://<repo>/<collection>/<rkey>`
+// URIs in the response; the underlying repo is always the server's own.
+//
+// The implementation walks the MST once to collect (rkey, cid) pairs
+// (cheap — these entries are already in memory after a normal repo
+// load), sorts them in the requested direction, then fetches the
+// record bodies only for the page we're returning. Per-call cost
+// scales with the collection's record count, not with the page size,
+// which is fine for server-repo-sized collections (origins, view
+// counts) but worth revisiting if a collection ever explodes.
 func ServerRepoListRecords(ctx context.Context, collection string, cursor string, limit int, repo string, reverse *bool) (*comatproto.RepoListRecords_Output, error) {
 	serverRepoLock.Lock()
 	defer serverRepoLock.Unlock()
@@ -414,28 +503,107 @@ func ServerRepoListRecords(ctx context.Context, collection string, cursor string
 	if err != nil {
 		return nil, fmt.Errorf("ServerRepoListRecords: failed to open repo: %w", err)
 	}
-	out := &comatproto.RepoListRecords_Output{
-		Records: []*comatproto.RepoListRecords_Record{},
+
+	if limit <= 0 {
+		limit = defaultListRecordsLimit
 	}
-	err = r.ForEach(ctx, "", func(rkey string, c cid.Cid) error {
-		raw, err := getBlock(ctx, ses, c)
-		if err != nil {
-			return fmt.Errorf("ServerRepoListRecords: %w", err)
+	if limit > maxListRecordsLimit {
+		limit = maxListRecordsLimit
+	}
+
+	prefix := collection + "/"
+
+	// 1. Walk every rkey in the collection. No body fetches here;
+	//    those happen below only for the records we end up returning.
+	type entry struct {
+		rkey string
+		c    cid.Cid
+	}
+	var entries []entry
+	err = r.ForEach(ctx, prefix, func(rpath string, c cid.Cid) error {
+		// ForEach walks lex-ascending from the prefix. As soon as we
+		// see a key that doesn't carry the prefix we're past the end
+		// of the requested collection — stop the walk.
+		if !strings.HasPrefix(rpath, prefix) {
+			return atrepo.ErrDoneIterating
 		}
-		val, err := lexutil.CborDecodeValue(raw)
-		if err != nil {
-			return fmt.Errorf("ServerRepoListRecords: failed to decode record for rkey %q: %w", rkey, err)
-		}
-		out.Records = append(out.Records, &comatproto.RepoListRecords_Record{
-			Uri:   fmt.Sprintf("at://%s/%s", repo, rkey),
-			Cid:   c.String(),
-			Value: &lexutil.LexiconTypeDecoder{Val: val},
+		entries = append(entries, entry{
+			rkey: strings.TrimPrefix(rpath, prefix),
+			c:    c,
 		})
 		return nil
 	})
-	if err != nil {
+	// Repo.ForEach compares the underlying mst walker's error against
+	// atrepo.ErrDoneIterating with `==`, but the walker wraps callback
+	// errors with `%w` before bubbling them up — so the sentinel never
+	// matches the equality check. Use errors.Is on our side so the
+	// early-exit path is observable through the wrapped error.
+	if err != nil && !errors.Is(err, atrepo.ErrDoneIterating) {
 		return nil, fmt.Errorf("ServerRepoListRecords: error iterating records: %w", err)
 	}
+
+	// 2. Order: newest-first by default (descending rkey, which is
+	//    descending TID-time for TID-shaped rkeys). `reverse=true`
+	//    flips back to oldest-first.
+	ascending := reverse != nil && *reverse
+	sort.Slice(entries, func(i, j int) bool {
+		if ascending {
+			return entries[i].rkey < entries[j].rkey
+		}
+		return entries[i].rkey > entries[j].rkey
+	})
+
+	// 3. Apply cursor. Cursor is the last rkey of the previous page;
+	//    skip past it in the active direction.
+	start := 0
+	if cursor != "" {
+		for i, e := range entries {
+			past := false
+			if ascending {
+				past = e.rkey > cursor
+			} else {
+				past = e.rkey < cursor
+			}
+			if past {
+				start = i
+				break
+			}
+			start = i + 1
+		}
+	}
+	end := start + limit
+	if end > len(entries) {
+		end = len(entries)
+	}
+	page := entries[start:end]
+
+	// 4. Fetch + decode bodies only for the page.
+	out := &comatproto.RepoListRecords_Output{
+		Records: make([]comatproto.RepoListRecords_Record, 0, len(page)),
+	}
+	for _, e := range page {
+		raw, err := getBlock(ctx, ses, e.c)
+		if err != nil {
+			return nil, fmt.Errorf("ServerRepoListRecords: %w", err)
+		}
+		val, err := glex.CborDecodeValue(raw)
+		if err != nil {
+			return nil, fmt.Errorf("ServerRepoListRecords: failed to decode record for rkey %q: %w", e.rkey, err)
+		}
+		out.Records = append(out.Records, comatproto.RepoListRecords_Record{
+			Uri:   fmt.Sprintf("at://%s/%s%s", repo, prefix, e.rkey),
+			Cid:   e.c.String(),
+			Value: &glex.LexiconTypeDecoder{Val: val},
+		})
+	}
+
+	// 5. Surface a cursor whenever there are more entries past this
+	//    page. If end == len(entries) we've returned everything left.
+	if end < len(entries) && len(page) > 0 {
+		cur := page[len(page)-1].rkey
+		out.Cursor = &cur
+	}
+
 	return out, nil
 }
 
@@ -447,7 +615,7 @@ func ServerRepoGetRecord(ctx context.Context, repo string, collection string, rk
 	if err != nil {
 		return nil, fmt.Errorf("ServerRepoGetRecord: failed to open repo: %w", err)
 	}
-	outCID, _, err := r.GetRecord(ctx, fmt.Sprintf("%s/%s", collection, rkey))
+	outCID, _, err := r.GetRecordBytes(ctx, fmt.Sprintf("%s/%s", collection, rkey))
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +623,7 @@ func ServerRepoGetRecord(ctx context.Context, repo string, collection string, rk
 	if err != nil {
 		return nil, fmt.Errorf("ServerRepoGetRecord: %w", err)
 	}
-	rec, err := lexutil.CborDecodeValue(raw)
+	rec, err := glex.CborDecodeValue(raw)
 	if err != nil {
 		return nil, fmt.Errorf("ServerRepoGetRecord: failed to decode record: %w", err)
 	}
@@ -463,7 +631,7 @@ func ServerRepoGetRecord(ctx context.Context, repo string, collection string, rk
 	return &comatproto.RepoGetRecord_Output{
 		Uri:   fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey),
 		Cid:   &str,
-		Value: &lexutil.LexiconTypeDecoder{Val: rec},
+		Value: &glex.LexiconTypeDecoder{Val: rec},
 	}, nil
 }
 
@@ -515,6 +683,87 @@ func ServerRepoGetRepo(ctx context.Context, since string) ([]byte, error) {
 
 	for _, blk := range blocks {
 		if _, err := carstore.LdWrite(buf, blk.Cid().Bytes(), blk.RawData()); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+// ServerRepoLatestCommit returns the server repo's current commit CID and its
+// revision, backing com.atproto.sync.getLatestCommit.
+//
+// Both values come out of a single delta session so they can never be torn:
+// the session's base CID *is* the commit the repo was opened at, and the rev is
+// read off that same commit. Reading the head and the rev through two separate
+// calls would let a concurrent CommitServerRepoRecord slip between them and
+// hand a peer a (cid, rev) pair that never existed -- which a verifying client
+// like pkg/reposync rejects outright.
+func ServerRepoLatestCommit(ctx context.Context) (cid.Cid, string, error) {
+	serverRepoLock.Lock()
+	defer serverRepoLock.Unlock()
+
+	r, ses, err := OpenServerRepo(ctx)
+	if err != nil {
+		return cid.Undef, "", fmt.Errorf("ServerRepoLatestCommit: %w", err)
+	}
+	return ses.BaseCid(), r.SignedCommit().Rev, nil
+}
+
+// ServerRepoGetBlocks returns the requested blocks of the server repo as a
+// rootless CARv1, backing com.atproto.sync.getBlocks.
+func ServerRepoGetBlocks(ctx context.Context, cids []cid.Cid) ([]byte, error) {
+	serverRepoLock.Lock()
+	defer serverRepoLock.Unlock()
+
+	_, ses, err := OpenServerRepo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ServerRepoGetBlocks: %w", err)
+	}
+	return getBlocksCAR(ctx, ses, cids)
+}
+
+// ErrBlockNotFound reports that a block asked for by CID is not in the repo's
+// store. It maps to the BlockNotFound error of com.atproto.sync.getBlocks.
+//
+// Omitting the block from the response instead would be worse than useless: a
+// walker cannot distinguish "you don't have it" from "I mis-parsed the CAR",
+// and pkg/reposync treats any missing block as a hard error anyway.
+var ErrBlockNotFound = errors.New("BlockNotFound")
+
+// getBlocksCAR writes cids out of ses as a CARv1 with an EMPTY roots list.
+//
+// Rootless is the shape com.atproto.sync.getBlocks is specified to return (and
+// what the reference PDS returns): the response is a bag of blocks, not a DAG
+// with an entry point. Note that go-car's NewCarReader refuses to parse such a
+// CAR -- consumers need raw car.ReadHeader, which is what pkg/reposync does.
+//
+// Duplicate CIDs are written once. A CID that isn't in the store fails the
+// whole request with ErrBlockNotFound.
+func getBlocksCAR(ctx context.Context, ses *carstore.DeltaSession, cids []cid.Cid) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	hb, err := cbor.DumpObject(&car.CarHeader{
+		Roots:   []cid.Cid{},
+		Version: 1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("getBlocksCAR: failed to dump car header: %w", err)
+	}
+	if _, err := carstore.LdWrite(buf, hb); err != nil {
+		return nil, err
+	}
+
+	seen := make(map[cid.Cid]struct{}, len(cids))
+	for _, c := range cids {
+		if _, ok := seen[c]; ok {
+			continue
+		}
+		seen[c] = struct{}{}
+		raw, err := getBlock(ctx, ses, c)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s", ErrBlockNotFound, c.String())
+		}
+		if _, err := carstore.LdWrite(buf, c.Bytes(), raw); err != nil {
 			return nil, err
 		}
 	}

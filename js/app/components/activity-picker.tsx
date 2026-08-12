@@ -9,16 +9,13 @@ import {
   zero,
 } from "@streamplace/components";
 import { ACTIVITY_LABELS } from "@streamplace/components/src/lib/metadata-constants";
+import { useStreamplaceStore } from "@streamplace/components/src/streamplace-store/streamplace-store";
 import { usePDSAgent } from "@streamplace/components/src/streamplace-store/xrpc";
 import { Image } from "expo-image";
 import { X } from "lucide-react-native";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Platform, Pressable, View } from "react-native";
-import {
-  GamesGamesgamesgamesgamesDefs,
-  PlaceStreamDefs,
-  PlaceStreamLivestream,
-} from "streamplace";
+import { games as gamesLex, place } from "streamplace";
 import { getDidFromAtUri, getGameCoverUrl } from "../utils/game";
 
 const { p, px, r, layout, borders, gap, flex } = zero;
@@ -27,13 +24,12 @@ interface GameResult {
   uri: string;
   name: string;
   coverUrl?: string;
-  genres?: string[];
 }
 
 interface ActivityPickerProps {
-  value: PlaceStreamLivestream.Record["activity"] | undefined;
+  value: place.stream.livestream.Main["activity"] | undefined;
   onChange: (
-    activity: PlaceStreamLivestream.Record["activity"] | undefined,
+    activity: place.stream.livestream.Main["activity"] | undefined,
   ) => void;
 }
 
@@ -50,10 +46,14 @@ export default function ActivityPicker({
   const agent = usePDSAgent();
   const { theme, zero: z } = useTheme();
   const c = theme.colors;
+  const gamesEnabled = useStreamplaceStore((s) => s.gamesEnabled);
 
-  const [mode, setMode] = useState<"game" | "label">(
-    value?.$type === "place.stream.defs#activityLabel" ? "label" : "game",
-  );
+  const [mode, setMode] = useState<"game" | "label">(() => {
+    if (value?.$type === "place.stream.defs#activityLabel") return "label";
+    if (value?.$type === "place.stream.defs#activityGame" && gamesEnabled)
+      return "game";
+    return gamesEnabled ? "game" : "label";
+  });
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<GameResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -67,22 +67,22 @@ export default function ActivityPicker({
 
   const selectedGame =
     value?.$type === "place.stream.defs#activityGame"
-      ? (value as PlaceStreamDefs.ActivityGame)
+      ? (value as place.stream.defs.ActivityGame)
       : null;
   const selectedLabel =
     value?.$type === "place.stream.defs#activityLabel"
-      ? (value as PlaceStreamDefs.ActivityLabel)
+      ? (value as place.stream.defs.ActivityLabel)
       : null;
 
   const showResults = searching || results.length > 0;
 
   useEffect(() => {
     if (!selectedGame || !agent || selectedCoverUrl !== undefined) return;
-    agent.place.stream.game
-      .getGame({ uri: selectedGame.uri })
+    agent.client
+      .call(place.stream.game.getGame, { uri: selectedGame.uri })
       .then((res) => {
-        setSelectedCoverUrl(res.data.coverUrl);
-        setSelectedGenres(res.data.genres ?? []);
+        setSelectedCoverUrl(res.coverUrl);
+        setSelectedGenres(res.genres ?? []);
       })
       .catch(() => {});
   }, [selectedGame?.uri]);
@@ -111,13 +111,15 @@ export default function ActivityPicker({
     debounceRef.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const res = await agent.place.stream.game.search({
+        const res = await agent.client.call(place.stream.game.search, {
           q: query,
           limit: 8,
         });
         const games: GameResult[] = [];
-        for (const result of res.data.results) {
-          if (!GamesGamesgamesgamesgamesDefs.isGameSummaryView(result))
+        for (const result of res.results) {
+          if (
+            !gamesLex.gamesgamesgamesgames.defs.gameSummaryView.isTypeOf(result)
+          )
             continue;
           const did = getDidFromAtUri(result.uri);
           const cover = getGameCoverUrl(result.media, did);
@@ -125,7 +127,6 @@ export default function ActivityPicker({
             uri: result.uri,
             name: result.name,
             coverUrl: cover,
-            genres: result.genres,
           });
         }
         setResults(games);
@@ -145,11 +146,10 @@ export default function ActivityPicker({
   const selectGame = (game: GameResult) => {
     onChange({
       $type: "place.stream.defs#activityGame",
-      uri: game.uri,
+      uri: game.uri as any,
       name: game.name,
     });
     setSelectedCoverUrl(game.coverUrl);
-    setSelectedGenres(game.genres ?? []);
     setQuery("");
     setResults([]);
   };
@@ -192,14 +192,6 @@ export default function ActivityPicker({
           />
           <View style={[flex.values[1]]}>
             <Text numberOfLines={1}>{game.name}</Text>
-            {game.genres && game.genres.length > 0 && (
-              <Text
-                numberOfLines={1}
-                style={{ fontSize: 11, color: c.mutedForeground }}
-              >
-                {game.genres.join(" · ")}
-              </Text>
-            )}
           </View>
         </Pressable>
       ))}
@@ -209,34 +201,36 @@ export default function ActivityPicker({
   return (
     <View style={[gap.all[2]]}>
       <View style={[layout.flex.row, gap.all[2]]}>
-        {(["game", "label"] as const).map((m) => (
-          <Pressable
-            key={m}
-            onPress={() => {
-              setMode(m);
-              if (m === "game" && selectedLabel) onChange(undefined);
-              if (m === "label" && selectedGame) onChange(undefined);
-            }}
-            style={[
-              px[3],
-              borders.width.thin,
-              { paddingVertical: 6, borderRadius: 6 },
-              { borderColor: mode === m ? c.border : c.border },
-              {
-                backgroundColor: mode === m ? c.card : "transparent",
-              },
-            ]}
-          >
-            <Text
-              style={{
-                color: mode === m ? c.primary : c.mutedForeground,
-                fontSize: 13,
+        {(["game", "label"] as const)
+          .filter((m) => m !== "game" || gamesEnabled)
+          .map((m) => (
+            <Pressable
+              key={m}
+              onPress={() => {
+                setMode(m);
+                if (m === "game" && selectedLabel) onChange(undefined);
+                if (m === "label" && selectedGame) onChange(undefined);
               }}
+              style={[
+                px[3],
+                borders.width.thin,
+                { paddingVertical: 6, borderRadius: 6 },
+                { borderColor: mode === m ? c.border : c.border },
+                {
+                  backgroundColor: mode === m ? c.card : "transparent",
+                },
+              ]}
             >
-              {m === "game" ? "Game" : "Other Activity"}
-            </Text>
-          </Pressable>
-        ))}
+              <Text
+                style={{
+                  color: mode === m ? c.primary : c.mutedForeground,
+                  fontSize: 13,
+                }}
+              >
+                {m === "game" ? "Game" : "Other Activity"}
+              </Text>
+            </Pressable>
+          ))}
       </View>
 
       {mode === "game" && (
@@ -262,26 +256,6 @@ export default function ActivityPicker({
               )}
               <View style={[flex.values[1]]}>
                 <Text style={{ color: c.primary }}>{selectedGame.name}</Text>
-                {selectedGenres.length > 0 && (
-                  <View
-                    style={[
-                      layout.flex.row,
-                      layout.flex.wrap.wrap,
-                      { marginTop: 4, rowGap: 4, columnGap: 2 },
-                    ]}
-                  >
-                    {selectedGenres.map((g) => (
-                      <View
-                        key={g}
-                        style={[z.bg.muted, px[2], r.full, { marginRight: 4 }]}
-                      >
-                        <Text size="xs" leading="snug" color="muted">
-                          {g}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
-                )}
               </View>
               <Pressable onPress={clearActivity}>
                 <X size={16} color={c.mutedForeground} />

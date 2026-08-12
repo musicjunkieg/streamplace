@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -83,9 +84,37 @@ func (mm *MediaManager) WebRTCPlayback2(ctx context.Context, user string, rendit
 
 	// Setup complete! Now we boot up streaming in the background while returning the SDP offer to the user.
 
+	// The session only counts as a viewer once the peer connection actually
+	// establishes — counting at SDP-answer time inflated the count with
+	// handshakes that never connected (each lingering until ICE failure
+	// detection). The mutex pairs the increment with exactly one decrement
+	// even if a connect races session teardown.
+	var viewerMu sync.Mutex
+	viewerCounted := false
+	viewerDone := false
+	markConnected := func() {
+		viewerMu.Lock()
+		defer viewerMu.Unlock()
+		if viewerDone || viewerCounted {
+			return
+		}
+		viewerCounted = true
+		mm.IncrementViewerCount(user, "webrtc")
+	}
+	markDone := func() {
+		viewerMu.Lock()
+		defer viewerMu.Unlock()
+		viewerDone = true
+		if viewerCounted {
+			viewerCounted = false
+			mm.DecrementViewerCount(user, "webrtc")
+		}
+	}
+
 	go func() {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
+		defer markDone()
 
 		latency := time.Duration(0)
 
@@ -132,44 +161,35 @@ func (mm *MediaManager) WebRTCPlayback2(ctx context.Context, user string, rendit
 					latency -= packet.Duration
 					scalar = getPlaybackRate(latency)
 					log.Debug(ctx, "playback latency", "latency", latency, "scalar", scalar)
-					var videoDur time.Duration
-					var audioDur time.Duration
-					if len(packet.Video) > 0 {
-						videoDur = packet.Duration / time.Duration(len(packet.Video))
-					}
-					if len(packet.Audio) > 0 {
-						audioDur = packet.Duration / time.Duration(len(packet.Audio))
-					}
 					g, _ := errgroup.WithContext(ctx)
+					wroteAny := false
 
-					if !audioOnly && videoDur > 0 {
+					if !audioOnly && len(packet.Video) > 0 {
+						wroteAny = true
 						g.Go(func() error {
-							ticker := time.NewTicker(time.Duration(float64(videoDur) * (1 / scalar)))
-							defer ticker.Stop()
-							for _, video := range packet.Video {
-								err := videoTrack.WriteSample(media.Sample{Data: video, Duration: videoDur})
-								if err != nil {
-									return fmt.Errorf("failed to write video sample: %w", err)
-								}
-
-								select {
-								case <-ctx.Done():
-									return nil
-								case <-ticker.C:
-									continue
-								}
-							}
-							return nil
+							return writeSamples(ctx, videoTrack, packet.Video, scalar)
 						})
 					} else if !audioOnly {
 						log.Warn(ctx, "no video samples to write")
 					}
+					// The audio path deliberately keeps the original
+					// uniform-duration ticker instead of writeSamples: Opus
+					// packets are a constant 20ms, so the uniform split is
+					// exact, and this path is proven in production — audio
+					// timing regressions are immediately audible as garbling.
+					// Video is the track that needs per-sample durations (its
+					// spacing goes non-uniform when an encoder sheds frames).
+					var audioDur time.Duration
+					if len(packet.Audio) > 0 {
+						audioDur = packet.Duration / time.Duration(len(packet.Audio))
+					}
 					if audioDur > 0 {
+						wroteAny = true
 						g.Go(func() error {
 							ticker := time.NewTicker(time.Duration(float64(audioDur) * (1 / scalar)))
 							defer ticker.Stop()
 							for _, audio := range packet.Audio {
-								err := audioTrack.WriteSample(media.Sample{Data: audio, Duration: audioDur})
+								err := audioTrack.WriteSample(media.Sample{Data: audio.Data, Duration: audioDur})
 								if err != nil {
 									return fmt.Errorf("failed to write audio sample: %w", err)
 								}
@@ -182,20 +202,18 @@ func (mm *MediaManager) WebRTCPlayback2(ctx context.Context, user string, rendit
 							}
 							return nil
 						})
-
+					} else {
+						log.Warn(ctx, "no audio samples to write")
+					}
+					if wroteAny {
 						if err := g.Wait(); err != nil {
 							log.Error(ctx, "failed to write samples", "error", err)
 							cancel()
 						}
-					} else {
-						log.Warn(ctx, "no audio samples to write")
 					}
 				}
 			}
 		}()
-
-		mm.IncrementViewerCount(user, "webrtc")
-		defer mm.DecrementViewerCount(user, "webrtc")
 
 		if !audioOnly {
 			go func() {
@@ -228,6 +246,10 @@ func (mm *MediaManager) WebRTCPlayback2(ctx context.Context, user string, rendit
 		peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 			log.Log(ctx, "Peer Connection State has changed", "state", s.String())
 
+			if s == webrtc.PeerConnectionStateConnected {
+				markConnected()
+			}
+
 			if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed || s == webrtc.PeerConnectionStateDisconnected {
 				// Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
 				// Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
@@ -248,6 +270,42 @@ func (mm *MediaManager) WebRTCPlayback2(ctx context.Context, user string, rendit
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// writeSamples writes one track's samples paced by their real durations —
+// the source timeline, so non-uniform frame spacing (bursts and gaps from an
+// encoder shedding frames) reaches the viewer intact. The stamped duration
+// stays real even while catch-up (scalar > 1) speeds the pacing: the
+// receiver's clock is authoritative for playout, sending faster just refills
+// its buffer.
+//
+// Pacing is against a wall-clock schedule, NOT a per-sample sleep: each sleep
+// overshoots by scheduler latency, and chaining sleeps accumulates that
+// overshoot into real drift (hundreds of ms per segment at high sample rates
+// — enough to starve the receiver's jitter buffer). Sleeping until the
+// scheduled deadline instead absorbs overshoot in the next iteration, like a
+// ticker does.
+func writeSamples(ctx context.Context, track *webrtc.TrackLocalStaticSample, samples []bus.PacketizedSample, scalar float64) error {
+	start := time.Now()
+	var scheduled time.Duration
+	for _, s := range samples {
+		if err := track.WriteSample(media.Sample{Data: s.Data, Duration: s.Duration}); err != nil {
+			return fmt.Errorf("failed to write sample: %w", err)
+		}
+		scheduled += time.Duration(float64(s.Duration) / scalar)
+		wait := scheduled - time.Since(start)
+		if wait <= 0 {
+			continue
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+	return nil
 }
 
 // getPlaybackRate returns a playback rate that eases from 1.0 to 1.5 between 7 and 60 seconds

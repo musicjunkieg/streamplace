@@ -10,11 +10,13 @@ import {
   PlayerUI,
   ShareSheet,
   Text,
-  useAvatars,
+  useAuthor,
+  useAvatar,
   useDID,
-  useLivestreamInfo,
   useLivestreamStore,
+  usePlayerStore,
   useTheme,
+  useTitle,
   zero,
 } from "@streamplace/components";
 import AQLink from "components/aqlink";
@@ -22,10 +24,7 @@ import FollowButton from "components/follow-button";
 import { Image } from "expo-image";
 import { ChevronLeft, ChevronRight } from "lucide-react-native";
 import { Linking, Pressable, ScrollView, View } from "react-native";
-import type {
-  ActivityGame,
-  ActivityLabel,
-} from "streamplace/src/lexicons/types/place/stream/defs";
+import type { place } from "streamplace";
 import { LANG_TAG_PREFIX, LANGUAGES } from "../live-dashboard/livestream-panel";
 import { KebabMenu } from "./desktop-ui/kebab";
 
@@ -82,10 +81,10 @@ export function BottomMetadata({
   setShowChat: (show: boolean) => void;
   showChat: boolean;
 }) {
-  const { profile } = useLivestreamInfo();
-  const avatars = useAvatars(profile?.did ? [profile?.did] : []);
+  const profile = useAuthor();
   const ls = useLivestreamStore((x) => x.livestream);
   const segment = useLivestreamStore((x) => x.segment);
+  const mode = usePlayerStore((x) => x.mode);
   const did = useDID();
 
   const contentWarnings =
@@ -93,9 +92,11 @@ export function BottomMetadata({
   const contentRights = segment?.contentRights;
 
   const { theme } = useTheme();
-  const avatarUri = profile?.did ? avatars[profile.did]?.avatar : undefined;
+  const avatarUri = useAvatar();
   const activity = ls?.record.activity as
-    | ((ActivityGame | ActivityLabel) & { $type?: string })
+    | ((place.stream.defs.ActivityGame | place.stream.defs.ActivityLabel) & {
+        $type?: string;
+      })
     | undefined;
   const activityLabel = activity ? formatActivity(activity) : null;
   const rawTags = ls?.record.tags as string[] | undefined;
@@ -188,7 +189,7 @@ export function BottomMetadata({
 
             {/* Title */}
             <Text numberOfLines={3} ellipsizeMode="tail" weight="semibold">
-              {ls?.record.title || "Stream Title"}
+              {useTitle()}
             </Text>
 
             {/* Activity + tags */}
@@ -234,21 +235,23 @@ export function BottomMetadata({
           <PlayerUI.Viewers />
           <ShareSheet />
           <KebabMenu />
-          <View>
-            <Button
-              variant="outline"
-              size="sm"
-              width="min"
-              style={{ aspectRatio: 1 }}
-              onPress={() => setShowChat(!showChat)}
-            >
-              {showChat ? (
-                <ChevronRight color="white" size={16} />
-              ) : (
-                <ChevronLeft color="white" size={16} />
-              )}
-            </Button>
-          </View>
+          {mode === "live" && (
+            <View>
+              <Button
+                variant="outline"
+                size="sm"
+                width="min"
+                style={{ aspectRatio: 1 }}
+                onPress={() => setShowChat(!showChat)}
+              >
+                {showChat ? (
+                  <ChevronRight color="white" size={16} />
+                ) : (
+                  <ChevronLeft color="white" size={16} />
+                )}
+              </Button>
+            </View>
+          )}
         </View>
       </View>
 

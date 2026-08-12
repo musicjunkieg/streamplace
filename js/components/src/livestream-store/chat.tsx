@@ -1,10 +1,6 @@
 import { ComAtprotoModerationCreateReport, RichText } from "@atproto/api";
 import { useCallback } from "react";
-import {
-  ChatMessageViewHydrated,
-  PlaceStreamChatMessage,
-  PlaceStreamDefs,
-} from "streamplace";
+import { ChatMessageViewHydrated, place } from "streamplace";
 import { useChatProfile, useDID, useHandle } from "../streamplace-store";
 import { usePDSAgent } from "../streamplace-store/xrpc";
 import { LivestreamState } from "./livestream-state";
@@ -114,12 +110,12 @@ export const useCreateChatMessage = () => {
       );
     });
 
-    const record: PlaceStreamChatMessage.Record = {
+    const record = {
       $type: "place.stream.chat.message",
       text: msg.text,
       createdAt: new Date().toISOString(),
       streamer: streamerProfile.did,
-      facets: rt.facets as PlaceStreamChatMessage.Record["facets"],
+      facets: rt.facets,
       ...(msg.reply
         ? {
             reply: {
@@ -134,28 +130,52 @@ export const useCreateChatMessage = () => {
             },
           }
         : {}),
-    };
+    } as unknown as place.stream.chat.message.Main;
 
     const localChat: ChatMessageViewHydrated = {
-      uri: `local-${Date.now()}`,
+      uri: `local-${Date.now()}` as any,
       cid: "",
       author: {
-        did: userDID,
-        handle: userHandle || userDID,
+        did: userDID as any,
+        handle: (userHandle || userDID) as any,
       },
       record: record,
-      indexedAt: new Date().toISOString(),
+      indexedAt: new Date().toISOString() as any,
       chatProfile: chatProfile || undefined,
     };
 
     state = reduceChat(state, [localChat], [], []);
     store.setState(state);
 
-    await pdsAgent.com.atproto.repo.createRecord({
-      repo: userDID,
-      collection: "place.stream.chat.message",
-      record,
-    });
+    try {
+      await pdsAgent.com.atproto.repo.createRecord({
+        repo: userDID,
+        collection: "place.stream.chat.message",
+        record,
+      });
+    } catch (err) {
+      // Remove the optimistic message if the server call fails
+      const currentState = store.getState();
+      const updatedIndex = { ...currentState.chatIndex };
+      for (const [key, existingMsg] of Object.entries(updatedIndex)) {
+        if (existingMsg.uri === localChat.uri) {
+          delete updatedIndex[key];
+          break;
+        }
+      }
+      store.setState({
+        ...currentState,
+        chatIndex: updatedIndex,
+        chat: Object.keys(updatedIndex)
+          .sort((a, b) => {
+            const aTime = parseInt(a.split("-")[0], 10);
+            const bTime = parseInt(b.split("-")[0], 10);
+            return bTime - aTime;
+          })
+          .map((key) => updatedIndex[key]),
+      });
+      throw err;
+    }
   };
 };
 
@@ -234,7 +254,7 @@ const profileIsDifferent = (
 export const reduceChatIncremental = (
   state: LivestreamState,
   newMessages: ChatMessageViewHydrated[],
-  blocks: PlaceStreamDefs.BlockView[],
+  blocks: place.stream.defs.BlockView[],
   hideUris: string[] = [],
 ): LivestreamState => {
   if (
@@ -479,22 +499,6 @@ export const usePinChatMessage = () => {
 
     // If streamer, create directly
     if (agent.did === streamerDID) {
-      // First delete any existing pinned records
-      const listResult = await agent.com.atproto.repo.listRecords({
-        repo: streamerDID,
-        collection: "place.stream.chat.pinnedRecord",
-      });
-      for (const rec of listResult.data.records) {
-        const rkey = rec.uri.split("/").pop();
-        if (rkey) {
-          await agent.com.atproto.repo.deleteRecord({
-            repo: streamerDID,
-            collection: "place.stream.chat.pinnedRecord",
-            rkey,
-          });
-        }
-      }
-
       const record = {
         $type: "place.stream.chat.pinnedRecord",
         pinnedMessage: messageUri,
@@ -511,11 +515,11 @@ export const usePinChatMessage = () => {
     }
 
     // Otherwise, use delegated moderation endpoint
-    const result = await agent.place.stream.moderation.createPin({
+    const result = await agent.client.call(place.stream.moderation.createPin, {
       streamer: streamerDID,
       messageUri,
       ...(expiresAt ? { expiresAt } : {}),
-    });
+    } as any);
     return result;
   };
 };
@@ -547,10 +551,10 @@ export const useUnpinChatMessage = () => {
     }
 
     // Otherwise, use delegated moderation endpoint
-    await agent.place.stream.moderation.deletePin({
+    await agent.client.call(place.stream.moderation.deletePin, {
       streamer: streamerDID,
       pinUri,
-    });
+    } as any);
     // Optimistically clear the pinned comment
     store.setState({ pinnedComment: null });
   };

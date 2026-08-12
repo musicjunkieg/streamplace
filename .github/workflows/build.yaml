@@ -13,14 +13,18 @@ concurrency:
 jobs:
   linux:
     name: ${{ matrix.name }}
+    # Skipped on forks: the linux targets need the warm upstream build
+    # cache to configure meson, and windows/android aren't part of fork
+    # validation. Upstream runs the full matrix.
+    if: github.repository == 'streamplace/streamplace'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - name: linux-amd64
             cmd: >-
-              make linux-amd64 && make static-test && make check && make
-              ci-lexicons
+              make linux-amd64 && make test-vod && make static-test && make
+              check && make ci-lexicons
           - name: linux-arm64
             cmd: "make linux-arm64"
           - name: windows-amd64
@@ -52,9 +56,20 @@ jobs:
           password: ${{ github.token }}
 
       - name: make node
+        # Forks can read the public build cache but can't push to the
+        # upstream ghcr registry, so only pass --cache-to on the main repo.
+        env:
+          CACHE_TO:
+            ${{ github.repository == 'streamplace/streamplace' && '--cache-to
+            ghcr.io/streamplace/streamplace' || '' }}
         run: |
           sudo apt install podman -y
-          make in-container BUILDER_TARGET=builder-no-darwin DOCKER_PWD_MOUNT_PATH=/app DOCKER_BUILD_OPTS="--layers --cache-to ghcr.io/streamplace/streamplace --cache-from ghcr.io/streamplace/streamplace" DOCKER_OPTS="-e STREAMPLACE_IGNORE_LEAKS=true -e STREAMPLACE_TEST_COUNT=1 -e CI=true -e GITHUB_ACTION=true" IN_CONTAINER_CMD="${{ matrix.cmd }}"
+          # Ubuntu 24.04's crun (1.14.1) rejects the OCI spec version newer
+          # podman emits ("unknown version specified", fixed in crun >= 1.14.3),
+          # and the 20260726 runner image update made that pairing fatal.
+          sudo curl -fsSL -o /usr/bin/crun https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-amd64
+          sudo chmod +x /usr/bin/crun
+          make in-container BUILDER_TARGET=builder-no-darwin DOCKER_PWD_MOUNT_PATH=/app DOCKER_BUILD_OPTS="--layers $CACHE_TO --cache-from ghcr.io/streamplace/streamplace" DOCKER_OPTS="-e STREAMPLACE_IGNORE_LEAKS=true -e STREAMPLACE_TEST_COUNT=1 -e CI=true -e GITHUB_ACTION=true" IN_CONTAINER_CMD="${{ matrix.cmd }}"
 
       - name: Publish Test Report
         if: matrix.name == 'linux-amd64' && (success() || failure())
@@ -135,7 +150,7 @@ jobs:
         run: |
           npm install -g corepack@latest \
           && corepack enable \
-          && export GOTOOLCHAIN=go1.25.1 \
+          && export GOTOOLCHAIN=go1.26.5 \
           && brew install go llvm \
           && rustup target add wasm32-wasip1 \
           && rustup target add wasm32-unknown-unknown \

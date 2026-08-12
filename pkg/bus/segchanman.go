@@ -14,14 +14,26 @@ import (
 
 type Seg struct {
 	Filepath       string
-	Data           []byte
+	Data           []byte // presentation flat MP4
+	Muxl           []byte // bare canonical .m4s (blindly concatenatable)
 	PacketizedData *PacketizedSegment
 	Published      bool
 }
 
+// PacketizedSample is one WebRTC-writable sample — a video access unit or an
+// Opus packet — with its real duration on the source timeline. Carrying the
+// per-sample duration (rather than dividing the segment evenly) keeps
+// non-uniform frame spacing intact: an encoder shedding frames under
+// bandwidth pressure sends bursts and gaps, and respacing those uniformly
+// rubber-bands the video against the audio.
+type PacketizedSample struct {
+	Data     []byte
+	Duration time.Duration
+}
+
 type PacketizedSegment struct {
-	Video    [][]byte
-	Audio    [][]byte
+	Video    []PacketizedSample
+	Audio    []PacketizedSample
 	Duration time.Duration
 }
 

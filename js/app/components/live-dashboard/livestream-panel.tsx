@@ -1,4 +1,5 @@
 import {
+  Admonition,
   Button,
   Checkbox,
   ContentMetadataForm,
@@ -25,7 +26,7 @@ import {
   zero,
 } from "@streamplace/components";
 import { Image } from "expo-image";
-import { ChevronsUpDown, ImagePlus, X } from "lucide-react-native";
+import { ChevronsUpDown, ImagePlus, Lock, X } from "lucide-react-native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Platform,
@@ -34,8 +35,13 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { useStore } from "store";
 import { useUserProfile } from "store/hooks";
-import type { PlaceStreamLivestream } from "streamplace";
+import type { place } from "streamplace";
+import {
+  SCOPE_BSKY_POST_CREATE,
+  scopeGrants,
+} from "../../features/bluesky/scopes";
 import { useCaptureVideoFrame } from "../../hooks/useCaptureVideoFrame";
 import { useLiveUser } from "../../hooks/useLiveUser";
 import ActivityPicker from "../activity-picker";
@@ -276,20 +282,19 @@ const ImageUploadComponent = ({
           )}
         </>
       )}
-      {/* <View style={{ marginTop: 8 }}>
-        <Admonition variant="info" size="sm">
-          <Text size="sm">
-            You are required to disclose if your content is not suitable for
-            certain viewers.
-          </Text>
-          <Pressable onPress={onGoToMetadata}>
-            <Text size="sm" color={zero.colors.blue[400]}>
-              Go to the metadata page{" "}
-              <ArrowRight size="14" style={{ marginVertical: -2 }} />
-            </Text>
-          </Pressable>
-        </Admonition>
-      </View> */}
+      {selectedImage &&
+        selectedImage instanceof Blob &&
+        selectedImage.size > 975000 && (
+          <View style={{ marginTop: 8 }}>
+            <Admonition variant="warning" size="sm">
+              <Text size="sm">
+                Heads up: this image is larger than 975KB (it's
+                {" " + selectedImage.size} bytes). Bluesky post creation might
+                fail.
+              </Text>
+            </Admonition>
+          </View>
+        )}
     </View>
   );
 };
@@ -317,11 +322,13 @@ function LivestreamPanel({ scrollable = true }: { scrollable?: boolean }) {
   );
 
   const [activity, setActivity] = useState<
-    PlaceStreamLivestream.Record["activity"] | undefined
+    place.stream.livestream.Main["activity"] | undefined
   >(undefined);
   const [tags, setTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState("");
 
+  const sessionScope = useStore((s) => s.sessionScope);
+  const canPostToBluesky = scopeGrants(sessionScope, SCOPE_BSKY_POST_CREATE);
   const [createPost, setCreatePost] = useState(true);
   const [idleTimeout, setIdleTimeout] = useState(true);
   const [sendPushNotification, setSendPushNotification] = useState(true);
@@ -345,7 +352,7 @@ function LivestreamPanel({ scrollable = true }: { scrollable?: boolean }) {
       if (livestream.record.activity) {
         setActivity(
           livestream.record
-            .activity as PlaceStreamLivestream.Record["activity"],
+            .activity as place.stream.livestream.Main["activity"],
         );
       }
 
@@ -404,7 +411,7 @@ function LivestreamPanel({ scrollable = true }: { scrollable?: boolean }) {
         await createStreamRecord({
           title: title.trim(),
           customThumbnail: thumbnailToUse as Blob | undefined,
-          submitPost: createPost,
+          submitPost: createPost && canPostToBluesky,
           notificationSettings: {
             pushNotification: sendPushNotification,
           },
@@ -502,7 +509,7 @@ function LivestreamPanel({ scrollable = true }: { scrollable?: boolean }) {
 
     try {
       const did = livestream.uri.split("/")[2];
-      const cid = (livestream.record.thumb.ref as any).$link;
+      const cid = (livestream.record.thumb as any).ref.$link;
 
       const didDoc = await resolveDIDDocument(did);
       const blob = await getBlob(did, cid, didDoc);
@@ -787,14 +794,30 @@ function LivestreamPanel({ scrollable = true }: { scrollable?: boolean }) {
                   ]}
                 >
                   <Tooltip
-                    content="Create a Bluesky post announcing you're live with a link to the stream."
+                    content={
+                      canPostToBluesky
+                        ? "Create a Bluesky post announcing you're live with a link to the stream."
+                        : "You signed in without granting Bluesky permissions, so Streamplace can't post to your account. Log out and back in to change this."
+                    }
                     position="top"
                   >
-                    <Checkbox
-                      checked={createPost}
-                      onCheckedChange={(checked) => setCreatePost(checked)}
-                      label="Create Bluesky post"
-                    />
+                    <View
+                      style={[
+                        layout.flex.row,
+                        { alignItems: "center" },
+                        gap.all[1],
+                      ]}
+                    >
+                      <Checkbox
+                        checked={createPost && canPostToBluesky}
+                        onCheckedChange={(checked) => setCreatePost(checked)}
+                        disabled={!canPostToBluesky}
+                        label="Create Bluesky post"
+                      />
+                      {!canPostToBluesky && (
+                        <Lock size={14} color={theme.colors.textMuted} />
+                      )}
+                    </View>
                   </Tooltip>
                   <Tooltip
                     content="Send a push notification to your followers on the Streamplace iOS/Android app."

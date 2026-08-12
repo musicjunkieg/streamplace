@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"strings"
 
 	"golang.org/x/net/html"
 	"stream.place/streamplace/pkg/config"
+	"stream.place/streamplace/pkg/placestream"
 	"stream.place/streamplace/pkg/statedb"
-	"stream.place/streamplace/pkg/streamplace"
 )
 
 type Linker struct {
@@ -56,9 +57,34 @@ var BrandingAssetList = [...]string{
 	"legalLinks",
 }
 
+// atTags returns meta tags implementing the at-tags proposal
+// (https://tangled.org/chrisshank.com/at-tags), which maps web pages back to
+// atproto identities and records via <meta name="at:*"> tags in the page
+// <head>:
+//
+//   - at:canonical — the AT URI of the record this page canonically maps to
+//     (pass "" to omit, e.g. for pages that don't represent a record)
+//   - at:author    — the atproto identity of the page's author, as an
+//     at://<did> URI (pass "" to omit)
+//   - at:me        — the identity of the overall website, i.e. this node's
+//     did:web, when a broadcaster host is configured
+func (l *Linker) atTags(canonicalURI string, authorDID string) []MetaTag {
+	tags := make([]MetaTag, 0, 3)
+	if strings.HasPrefix(canonicalURI, "at://") {
+		tags = append(tags, MetaTag{Type: "name", Key: "at:canonical", Content: canonicalURI})
+	}
+	if authorDID != "" {
+		tags = append(tags, MetaTag{Type: "name", Key: "at:author", Content: "at://" + authorDID})
+	}
+	if l.cli != nil && l.cli.BroadcasterHost != "" {
+		tags = append(tags, MetaTag{Type: "name", Key: "at:me", Content: "at://did:web:" + l.cli.BroadcasterHost})
+	}
+	return tags
+}
+
 // fetch branding assets for a given broadcaster DID
-func (l *Linker) getBrandingAssets(broadcasterDid string) ([]streamplace.BrandingGetBranding_BrandingAsset, error) {
-	ret := make([]streamplace.BrandingGetBranding_BrandingAsset, 0)
+func (l *Linker) getBrandingAssets(broadcasterDid string) ([]placestream.BrandingGetBranding_BrandingAsset, error) {
+	ret := make([]placestream.BrandingGetBranding_BrandingAsset, 0)
 	for _, asset := range BrandingAssetList {
 		blob, err := l.sdb.GetBrandingBlob(broadcasterDid, asset)
 		if err != nil {
@@ -66,7 +92,7 @@ func (l *Linker) getBrandingAssets(broadcasterDid string) ([]streamplace.Brandin
 			log.Printf("error fetching branding asset %s for broadcaster %s: %v", asset, broadcasterDid, err)
 			continue
 		}
-		asset := streamplace.BrandingGetBranding_BrandingAsset{
+		asset := placestream.BrandingGetBranding_BrandingAsset{
 			Key:      blob.Key,
 			MimeType: blob.MimeType,
 		}
@@ -94,14 +120,14 @@ func (l *Linker) getBrandingAssets(broadcasterDid string) ([]streamplace.Brandin
 	return ret, nil
 }
 
-func (l *Linker) GenerateStreamerCard(ctx context.Context, u *url.URL, lsv *streamplace.Livestream_LivestreamView, sentryDSN string) ([]byte, error) {
+func (l *Linker) GenerateStreamerCard(ctx context.Context, u *url.URL, lsv *placestream.Livestream_LivestreamView, sentryDSN string) ([]byte, error) {
 	if u == nil {
 		return nil, errors.New("url is nil")
 	}
 	if lsv == nil {
 		return nil, errors.New("livestream view is nil")
 	}
-	ls, ok := lsv.Record.Val.(*streamplace.Livestream)
+	ls, ok := lsv.Record.Val.(*placestream.Livestream)
 	if !ok {
 		return nil, errors.New("livestream view is not a livestream")
 	}
@@ -169,8 +195,116 @@ func (l *Linker) GenerateStreamerCard(ctx context.Context, u *url.URL, lsv *stre
 		Content: fmt.Sprintf("%s%s", titleStr, brandingTitle),
 	})
 
+	// at-tags: this page canonically maps to the livestream record, authored
+	// by the streamer
+	metaTags = append(metaTags, l.atTags(lsv.Uri, lsv.Author.Did)...)
+
 	return l.GenerateHTML(ctx, &PageConfig{
 		Title:     fmt.Sprintf("%s%s", titleStr, brandingTitle),
+		Metas:     metaTags,
+		SentryDSN: sentryDSN,
+	})
+}
+
+func (l *Linker) GenerateVideoCard(ctx context.Context, u *url.URL, vv *placestream.MediaGetVideo_VideoView, sentryDSN string) ([]byte, error) {
+	if u == nil {
+		return nil, errors.New("url is nil")
+	}
+	if vv == nil {
+		return nil, errors.New("video view is nil")
+	}
+	video, ok := vv.Record.Val.(*placestream.Video)
+	if !ok {
+		return nil, errors.New("video view record is not a video")
+	}
+
+	outURL := u.String()
+
+	authorDid := ""
+	authorHandle := ""
+	if !false {
+		authorDid = vv.Author.Did
+		authorHandle = vv.Author.Handle
+	}
+
+	// og:image is the VOD's own thumbnail, served through the Bluesky image
+	// CDN (which fetches the blob from the author's PDS — the same trick used
+	// for game cover art). When the video has no thumbnail we fall back to the
+	// author's generated profile card so the link still carries an image.
+	var imageURL string
+	if video.Thumb != nil && authorDid != "" {
+		imageURL = fmt.Sprintf(
+			"https://cdn.bsky.app/img/feed_thumbnail/plain/%s/%s@jpeg",
+			authorDid, video.Thumb.Ref.String(),
+		)
+	} else {
+		cardURL, _ := url.Parse(u.String())
+		cardURL.Path = "/xrpc/place.stream.live.getProfileCard"
+		cardURL.RawQuery = fmt.Sprintf("id=%s", authorDid)
+		imageURL = cardURL.String()
+	}
+
+	// Define all meta tags. The title/description pair is appended after we
+	// resolve the node's branding title below: the card headline is the
+	// video's own title, and the author + node go in the description.
+	metaTags := []MetaTag{
+		// Facebook Meta Tags
+		{Type: "property", Key: "og:url", Content: outURL},
+		{Type: "property", Key: "og:type", Content: "video.other"},
+		{Type: "property", Key: "og:image", Content: imageURL},
+
+		// Twitter Meta Tags
+		{Type: "name", Key: "twitter:card", Content: "summary_large_image"},
+		{Type: "property", Key: "twitter:domain", Content: u.Host},
+		{Type: "property", Key: "twitter:url", Content: outURL},
+		{Type: "name", Key: "twitter:image", Content: imageURL},
+	}
+
+	brandingTitle := "streamplace node"
+	if l.sdb != nil && l.cli != nil {
+		branding, err := l.getBrandingAssets("did:web:" + l.cli.BroadcasterHost)
+		if err == nil {
+			for i := range branding {
+				val := branding[i]
+				if val.Key == "siteTitle" && val.Data != nil {
+					brandingTitle = *val.Data
+				}
+				marshalledJson, err := json.Marshal(val)
+				if err != nil {
+					fmt.Printf("error marshalling branding asset %s: %v\n", val.Key, err)
+					continue
+				}
+				metaTags = append(metaTags, MetaTag{
+					Type:    "name",
+					Key:     "internal-brand:" + val.Key,
+					Content: string(marshalledJson),
+				})
+			}
+		} else {
+			// log but we should not block rendering
+			fmt.Printf("error fetching branding assets: %v\n", err)
+		}
+	}
+
+	// The card headline is the video's own title; the author + node name go
+	// in the description. Appended after the branding loop so the description
+	// can reference the resolved branding title.
+	title := video.Title
+	description := fmt.Sprintf("@%s's video on %s", authorHandle, brandingTitle)
+	metaTags = append(metaTags,
+		MetaTag{Type: "name", Key: "description", Content: description},
+		MetaTag{Type: "property", Key: "og:description", Content: description},
+		MetaTag{Type: "property", Key: "og:title", Content: title},
+		MetaTag{Type: "name", Key: "twitter:description", Content: description},
+		MetaTag{Type: "name", Key: "twitter:title", Content: title},
+	)
+
+	// at-tags: this page canonically maps to the place.stream.video record,
+	// authored by the streamer
+	metaTags = append(metaTags, l.atTags(vv.Uri, authorDid)...)
+
+	return l.GenerateHTML(ctx, &PageConfig{
+		Title:     title,
 		Metas:     metaTags,
 		SentryDSN: sentryDSN,
 	})
@@ -242,6 +376,10 @@ func (l *Linker) GenerateDefaultCard(ctx context.Context, u *url.URL, sentryDSN 
 		Key:     "twitter:title",
 		Content: brandingTitle,
 	})
+
+	// at-tags: the site itself is identified by this node's did:web; there's
+	// no single author or canonical record for the front page
+	metaTags = append(metaTags, l.atTags("", "")...)
 
 	return l.GenerateHTML(ctx, &PageConfig{
 		Title:     brandingTitle,

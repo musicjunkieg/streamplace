@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"stream.place/streamplace/pkg/streamplace"
+	"stream.place/streamplace/pkg/placestream"
 )
 
 type delegationGetter interface {
-	GetModerationDelegations(ctx context.Context, streamerDID, moderatorDID string) ([]*streamplace.ModerationDefs_PermissionView, error)
+	GetModerationDelegations(ctx context.Context, streamerDID, moderatorDID string) ([]placestream.ModerationDefs_PermissionView, error)
 }
 
 // Permission scope constants
@@ -18,6 +18,7 @@ const (
 	PermissionHide             = "hide"
 	PermissionLivestreamManage = "livestream.manage"
 	PermissionMessagePin       = "message.pin"
+	PermissionVodCommentHide   = "vod.comment.hide"
 )
 
 // ActionPermissions maps moderation actions to required permissions
@@ -26,6 +27,8 @@ var ActionPermissions = map[string]string{
 	"deleteBlock":      PermissionBan,
 	"createGate":       PermissionHide,
 	"deleteGate":       PermissionHide,
+	"createVodGate":    PermissionVodCommentHide,
+	"deleteVodGate":    PermissionVodCommentHide,
 	"updateLivestream": PermissionLivestreamManage,
 	"createPin":        PermissionMessagePin,
 	"deletePin":        PermissionMessagePin,
@@ -89,7 +92,7 @@ func (pc *PermissionChecker) HasPermission(ctx context.Context, moderatorDID, st
 	// Check all delegation records and merge their permissions
 	for _, delegationView := range delegations {
 		// Extract the actual permission record from the view
-		permRecord, ok := delegationView.Record.Val.(*streamplace.ModerationPermission)
+		permRecord, ok := delegationView.Record.Val.(*placestream.ModerationPermission)
 		if !ok {
 			return false, fmt.Errorf("failed to cast record to ModerationPermission")
 		}

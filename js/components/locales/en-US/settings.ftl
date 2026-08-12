@@ -36,6 +36,8 @@ currently-translating-description = Some parts of the app may look incomplete. T
 ## Debug Recording
 debug-recording-title = Allow { $host } to record your livestream for debugging and improving the service
 debug-recording-description = Optional
+livestream-recording-title = Record my livestreams into VODs on { $host }
+livestream-recording-description = When enabled, your livestreams are saved so you can finalize and publish them as videos
 
 ## Key Management
 manage-keys = Manage Keys
@@ -53,6 +55,12 @@ developer = Developer
 languages = Languages
 privacy-security = Privacy & Security
 streaming = Streaming
+notifications = Notifications
+notifications-title = Push Notifications
+notifications-web-description = Get notified when streamers you follow go live.
+notifications-mobile-description = Push notifications are managed by your device settings.
+notifications-blocked-description = Blocked — you denied notification permission in your browser.
+notifications-blocked-help = To re-enable, update site permissions in your browser settings, then toggle this on again.
 
 ## Common Actions
 cancel = Cancel
@@ -143,6 +151,7 @@ activates-on = Activates on:
 events = Events
 events-livestream = Livestream Events
 events-chat = Chat Events
+events-stream-received = Stream Received Events
 untitled-webhook = Untitled Webhook
 inactive = Inactive
 active = Active

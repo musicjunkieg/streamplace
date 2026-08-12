@@ -4,6 +4,8 @@ on: push
 
 jobs:
   sync:
+    # Mirror push needs upstream's GITLAB_PAT secret; skip on forks.
+    if: github.repository == 'streamplace/streamplace'
     runs-on: ubuntu-slim
     steps:
       - uses: keninkujovic/gitlab-sync@2.0.0

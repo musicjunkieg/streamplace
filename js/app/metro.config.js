@@ -50,11 +50,28 @@ config.resolver.resolveRequest = (context, moduleName, platform) => {
     }
   }
   // otherwise chain to the standard Metro resolver.
-  return context.resolveRequest(context, moduleName, platform);
+  try {
+    return context.resolveRequest(context, moduleName, platform);
+  } catch (error) {
+    // The `streamplace` workspace package is ESM and (per Node's ESM rules)
+    // uses explicit ".js" extensions on its relative imports even though the
+    // sources are ".ts"/".tsx" (e.g. the generated lexicon files). Metro does
+    // not perform that ".js" -> ".ts" remap, so retry extension-less.
+    if (moduleName.startsWith(".") && moduleName.endsWith(".js")) {
+      return context.resolveRequest(context, moduleName.slice(0, -3), platform);
+    }
+    throw error;
+  }
 };
 
 config.resolver.sourceExts.push("mjs");
 config.resolver.assetExts.push("md");
+
+// Make Metro pick `.tv.tsx` before `.ios.tsx` when building for tvOS.
+// react-native-tvos reports its platform as `tv` to Metro, so this lets
+// us ship TV-specific screens as platform-extension siblings of the
+// existing phone screens without touching the phone code path.
+config.resolver.platforms = ["tv", ...config.resolver.platforms];
 
 config.resolver.unstable_conditionNames.push("@streamplace/dev", "browser");
 

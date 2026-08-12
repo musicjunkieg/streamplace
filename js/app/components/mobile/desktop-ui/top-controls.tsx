@@ -4,10 +4,11 @@ import {
   PlayerUI,
   Text,
   View,
-  useAvatars,
+  useAuthor,
+  useAvatar,
   useCameraToggle,
-  useLivestreamInfo,
   useLivestreamStore,
+  useTitle,
   zero,
 } from "@streamplace/components";
 import { Image } from "expo-image";
@@ -41,12 +42,14 @@ export function TopControlBar({
   embedded = false,
 }: TopControlBarProps) {
   const navigation = useNavigation();
-  const { profile } = useLivestreamInfo();
+  const profile = useAuthor();
   const { doSetIngestCamera } = useCameraToggle();
-  const avatars = useAvatars(profile?.did && embedded ? [profile?.did] : []);
+  const avatar = useAvatar();
   const { width } = useWindowDimensions();
   const isTinyScreen = width < 450;
   const isSmallScreen = width < 600;
+
+  const title = useTitle();
 
   // Get content warnings from segment
   const segment = useLivestreamStore((x) => x.segment);
@@ -87,8 +90,8 @@ export function TopControlBar({
               >
                 <Image
                   source={
-                    profile?.did
-                      ? { uri: avatars[profile?.did]?.avatar }
+                    avatar
+                      ? { uri: avatar }
                       : require("assets/images/goose.png")
                   }
                   style={[
@@ -103,13 +106,9 @@ export function TopControlBar({
                   ]}
                 />
 
-                <View style={[layout.flex.column, gap.all[1]]}>
-                  <Text
-                    style={[text.white, { fontSize: 16, fontWeight: "600" }]}
-                  >
-                    {profile?.handle}
-                  </Text>
-                  {!offline && <LiveBubble />}
+                <View style={[layout.flex.column]}>
+                  <Text weight="semibold">{title}</Text>
+                  <Text leading="tight">{profile?.handle}</Text>
                 </View>
               </View>
             </View>
